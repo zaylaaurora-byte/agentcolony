@@ -115,6 +115,45 @@ export default function Home() {
             }
           }
 
+          // ── Alive behaviors (only when idle and not doing anything) ──
+          if (!agent.isMoving && agent.animState === 'idle' && agent.speechTimer <= 0 && agent.spawnEffect <= 0) {
+            agent.idleTimer++;
+            // Random emote when standing around
+            if (agent.idleTimer > 80 && agent.emoteTimer <= 0) {
+              const emotes = ['💭', '💤', '🎵', '👀', '✨', '🤔', '😄'];
+              agent.emote = emotes[Math.floor(Math.random() * emotes.length)];
+              agent.emoteTimer = 60 + Math.floor(Math.random() * 40);
+              agent.idleTimer = 0;
+              changed = true;
+            }
+            // Wander around randomly when idle for a while
+            agent.wanderTimer--;
+            if (agent.wanderTimer <= 0) {
+              const wanderRange = 4;
+              const newTx = agent.tileX + Math.floor(Math.random() * wanderRange * 2) - wanderRange;
+              const newTy = agent.tileY + Math.floor(Math.random() * wanderRange * 2) - wanderRange;
+              const clampedTx = Math.max(2, Math.min(MAP_COLS - 3, newTx));
+              const clampedTy = Math.max(2, Math.min(MAP_ROWS - 3, newTy));
+              agent.targetTileX = clampedTx;
+              agent.targetTileY = clampedTy;
+              agent.animState = 'wander';
+              agent.wanderTimer = 100 + Math.random() * 200;
+              agent.wanderCount++;
+              changed = true;
+            }
+          } else if (agent.animState === 'wander' && !agent.isMoving) {
+            // Arrived at wander destination, go back to idle
+            agent.animState = 'idle';
+            agent.idleTimer = 0;
+            changed = true;
+          }
+
+          // Decrease emote timer
+          if (agent.emoteTimer > 0) {
+            agent.emoteTimer--;
+            if (agent.emoteTimer <= 0) agent.emote = '';
+          }
+
           // Decrease spawn effect
           if (agent.spawnEffect > 0) {
             agent.spawnEffect -= 0.02;
@@ -175,6 +214,7 @@ export default function Home() {
       for (const agentId of (data.agents || ['mastermind', 'worker'])) {
         const pos = posMap[agentId] || { x: 20, y: 15 };
         const config = AGENT_CONFIG[agentId as AgentId];
+        const charIndexMap: Record<string, number> = { mastermind: 0, worker: 1, reviewer: 2, creative: 3, hacker: 4, analyst: 5 };
         entities[agentId] = {
           agentId,
           tileX: pos.x, tileY: pos.y,
@@ -192,6 +232,12 @@ export default function Home() {
           color: config?.color ?? '#888',
           name: config?.name ?? agentId,
           energy: 100,
+          charIndex: charIndexMap[agentId] ?? 0,
+          wanderTimer: 60 + Math.random() * 120,
+          wanderCount: 0,
+          idleTimer: 0,
+          emote: '',
+          emoteTimer: 0,
         };
       }
       setAgentEntities(entities);
@@ -300,6 +346,12 @@ export default function Home() {
           color: config?.color ?? '#888',
           name: config?.name ?? name ?? agentId,
           energy: 100,
+          charIndex: Object.keys(entities).length % 6,
+          wanderTimer: 80 + Math.random() * 100,
+          wanderCount: 0,
+          idleTimer: 0,
+          emote: '🤩',
+          emoteTimer: 60,
         },
       }));
 
