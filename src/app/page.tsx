@@ -56,8 +56,8 @@ export default function Home() {
 
   // Connect to socket
   useEffect(() => {
-    const socket = io('/socket.io/?XTransformPort=3004', {
-      transports: ['websocket', 'polling'], forceNew: true, reconnection: true, reconnectionAttempts: 10, path: '/',
+    const socket = io('/?XTransformPort=3004', {
+      transports: ['websocket', 'polling'], forceNew: true, reconnection: true, reconnectionAttempts: 10,
     });
     socketRef.current = socket;
     socket.on('connect', () => store.setConnected(true));

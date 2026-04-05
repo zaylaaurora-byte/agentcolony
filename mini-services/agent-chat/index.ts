@@ -115,6 +115,7 @@ interface Session {
   bestOutput: string;
   userMessages: string[];
   agentPositions: Record<string, { x: number; y: number; targetX: number; targetY: number; station: string }>;
+  socket: any;
 }
 
 // ─── Agent Definitions ──────────────────────────────────────────────────────
@@ -253,7 +254,6 @@ function moveAgent(session: Session, agentId: string, station: string) {
   const pos = session.agentPositions[agentId];
   if (pos) {
     pos.station = station;
-    // Target positions for different stations
     const stationPositions: Record<string, { x: number; y: number }> = {
       "planning-desk": { x: 20, y: 25 },
       workbench: { x: 50, y: 60 },
@@ -265,15 +265,12 @@ function moveAgent(session: Session, agentId: string, station: string) {
     const target = stationPositions[station] || stationPositions.center;
     pos.targetX = target.x;
     pos.targetY = target.y;
-    // We'll emit positions to the client
-    if (pos.socketRef) {
-      pos.socketRef.emit("agent-move", {
-        agentId,
-        x: pos.targetX,
-        y: pos.targetY,
-        station,
-      });
-    }
+    session.socket.emit("agent-move", {
+      agentId,
+      targetX: pos.targetX,
+      targetY: pos.targetY,
+      station,
+    });
   }
 }
 
@@ -296,10 +293,10 @@ async function runAgentLoop(
   sessionId: string,
   goal: string,
   agents: string[],
-  socket: any
+  socket: any,
+  session: Session
 ) {
   const config = loadConfig();
-  const session = sessions.get(sessionId)!;
   const loopConfig = config.loop;
 
   let hasWorker = agents.includes("worker");
@@ -388,7 +385,6 @@ ${!hasWorker ? "NOTE: No Worker available — you must handle execution yourself
             targetX: idlePositions[posIdx]?.x || 50,
             targetY: idlePositions[posIdx]?.y || 70,
             station: "idle",
-            socketRef: socket,
           };
           socket.emit("agent-summoned", {
             agentId: agentToSummon,
@@ -570,7 +566,6 @@ io.on("connection", (socket) => {
         targetX: positions[i]?.x || 50,
         targetY: positions[i]?.y || 70,
         station: "idle",
-        socketRef: socket,
       };
     });
 
@@ -588,6 +583,7 @@ io.on("connection", (socket) => {
       bestOutput: "",
       userMessages: [],
       agentPositions,
+      socket,
     };
 
     sessions.set(sessionId, session);
@@ -602,7 +598,7 @@ io.on("connection", (socket) => {
       },
     });
 
-    runAgentLoop(sessionId, goal, agents, socket).catch((err) => {
+    runAgentLoop(sessionId, goal, agents, socket, session).catch((err) => {
       console.error("Unhandled loop error:", err);
     });
   });
@@ -621,8 +617,7 @@ io.on("connection", (socket) => {
           content: data.message,
           timestamp: new Date().toISOString(),
         };
-        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
-        if (sock) sock.emit("agent-message", msg);
+        session.socket.emit("agent-message", msg);
       }
     }
   });
@@ -632,8 +627,7 @@ io.on("connection", (socket) => {
       if (session.status === "running") {
         session.paused = true;
         session.status = "paused";
-        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
-        if (sock) sock.emit("session-status", { status: "paused" });
+        session.socket.emit("session-status", { status: "paused" });
       }
     }
   });
@@ -643,8 +637,7 @@ io.on("connection", (socket) => {
       if (session.status === "paused") {
         session.paused = false;
         session.status = "running";
-        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
-        if (sock) sock.emit("session-status", { status: "running" });
+        session.socket.emit("session-status", { status: "running" });
       }
     }
   });
@@ -655,8 +648,7 @@ io.on("connection", (socket) => {
         session.stopped = true;
         session.paused = false;
         session.status = "complete";
-        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
-        if (sock) sock.emit("session-status", { status: "complete" });
+        session.socket.emit("session-status", { status: "complete" });
       }
     }
   });

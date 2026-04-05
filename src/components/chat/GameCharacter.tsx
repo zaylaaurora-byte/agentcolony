@@ -32,12 +32,12 @@ function MastermindSVG({ color, animState, direction = 'down', size = 48 }: { co
         <circle cx="16" cy="14" r="7" fill="#F5D6C6" />
         {/* Eyes */}
         {direction === 'down' ? (
-          <>
+          <g>
             <circle cx="13" cy="13" r="1.2" fill="#333" />
             <circle cx="19" cy="13" r="1.2" fill="#333" />
             <circle cx="13.3" cy="12.7" r="0.4" fill="white" />
             <circle cx="19.3" cy="12.7" r="0.4" fill="white" />
-          </>
+          </g>
         ) : direction === 'up' ? null : (
           <circle cx={direction === 'right' ? '19' : '13'} cy="13" r="1.2" fill="#333" />
         )}
@@ -54,49 +54,48 @@ function MastermindSVG({ color, animState, direction = 'down', size = 48 }: { co
         <path d="M13 9 Q14 7 16 8 Q18 7 19 9 Q17 10 16 9 Q15 10 13 9Z" fill="white" opacity="0.7" />
         {/* Star particles when working */}
         {animState === 'work' && (
-          <>
+          <g>
             <circle cx="6" cy="10" r="0.8" fill={color} opacity="0.6" />
             <circle cx="26" cy="8" r="0.6" fill={color} opacity="0.4" />
             <circle cx="8" cy="22" r="0.5" fill={color} opacity="0.5" />
-          </>
+          </g>
         )}
         {/* Legs */}
         {animState === 'walk' ? (
-          <>
+          <g>
             <path d="M13 38 L12 42" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M19 38 L20 42" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <path d="M13 38 L13 41" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M19 38 L19 41" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         )}
         {/* Arms */}
         {animState === 'work' ? (
-          <>
+          <g>
             <path d="M8 22 L4 18" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
             <path d="M24 22 L28 18" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
-            {/* Glowing orb */}
             <circle cx="16" cy="7" r="2" fill={color} opacity="0.4" />
-          </>
+          </g>
         ) : animState === 'talk' ? (
-          <>
+          <g>
             <path d="M8 22 L5 26" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
             <path d="M24 22 L27 20" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <path d="M8 22 L6 28" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
             <path d="M24 22 L26 28" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         )}
       </svg>
     </div>
   );
 }
 
-// ─── Worker: Robot with hard hat ──────────────────────────────────────────
+// ─── Worker: Builder with hard hat ─────────────────────────────────────────
 
 function WorkerSVG({ color, animState, direction = 'down', size = 48 }: { color: string; animState: AnimState; direction: string; size: number }) {
   const walkBob = animState === 'walk' ? 'animate-bounce-subtle' : '';
@@ -119,10 +118,10 @@ function WorkerSVG({ color, animState, direction = 'down', size = 48 }: { color:
         <path d="M10 12 Q16 6 22 12" fill={color} />
         {/* Eyes */}
         {direction === 'down' ? (
-          <>
+          <g>
             <circle cx="13.5" cy="12.5" r="1.2" fill="#333" />
             <circle cx="18.5" cy="12.5" r="1.2" fill="#333" />
-          </>
+          </g>
         ) : direction === 'up' ? null : (
           <circle cx={direction === 'right' ? '18.5' : '13.5'} cy="12.5" r="1.2" fill="#333" />
         )}
@@ -134,42 +133,41 @@ function WorkerSVG({ color, animState, direction = 'down', size = 48 }: { color:
         )}
         {/* Wrench in hand when working */}
         {animState === 'work' && (
-          <>
+          <g>
             <path d="M26 18 L30 14 L31 15 L27 19 Z" fill="#AAA" />
             <circle cx="30" cy="13" r="1.5" fill="none" stroke="#AAA" strokeWidth="1" />
-            {/* Sparks */}
             <circle cx="30" cy="11" r="0.5" fill="#FFD700" opacity="0.8" />
             <circle cx="32" cy="13" r="0.4" fill="#FFD700" opacity="0.6" />
-          </>
+          </g>
         )}
         {/* Legs */}
         {animState === 'walk' ? (
-          <>
+          <g>
             <rect x="12" y="36" width="3" height="6" rx="1" fill="#556" />
             <rect x="17" y="36" width="3" height="6" rx="1" fill="#556" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <rect x="12" y="36" width="3" height="5" rx="1" fill="#556" />
             <rect x="17" y="36" width="3" height="5" rx="1" fill="#556" />
-          </>
+          </g>
         )}
         {/* Arms */}
         {animState === 'work' ? (
-          <>
+          <g>
             <path d="M10 21 L6 24" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M22 21 L26 18" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : animState === 'talk' ? (
-          <>
+          <g>
             <path d="M10 21 L6 18" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M22 21 L26 19" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <path d="M10 21 L7 27" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M22 21 L25 27" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         )}
       </svg>
     </div>
@@ -202,10 +200,10 @@ function ReviewerSVG({ color, animState, direction = 'down', size = 48 }: { colo
         <line x1="16" y1="13" x2="16" y2="13" stroke={color} strokeWidth="1.2" />
         {/* Eyes through goggles */}
         {direction === 'down' ? (
-          <>
+          <g>
             <circle cx="13" cy="13" r="1" fill="#333" />
             <circle cx="19" cy="13" r="1" fill="#333" />
-          </>
+          </g>
         ) : direction === 'up' ? null : (
           <circle cx={direction === 'right' ? '19' : '13'} cy="13" r="1" fill="#333" />
         )}
@@ -217,44 +215,43 @@ function ReviewerSVG({ color, animState, direction = 'down', size = 48 }: { colo
         )}
         {/* Clipboard when working */}
         {animState === 'work' && (
-          <>
+          <g>
             <rect x="25" y="16" width="6" height="8" rx="0.5" fill="#8B7355" />
             <rect x="25.5" y="16.5" width="5" height="7" rx="0.3" fill="#FFF8E7" />
             <line x1="26.5" y1="18.5" x2="30" y2="18.5" stroke="#CCC" strokeWidth="0.3" />
             <line x1="26.5" y1="19.5" x2="30" y2="19.5" stroke="#CCC" strokeWidth="0.3" />
             <line x1="26.5" y1="20.5" x2="29" y2="20.5" stroke="#CCC" strokeWidth="0.3" />
-            {/* Checkmark */}
             <path d="M27 21.5 L28 22.5 L30 20.5" stroke={color} strokeWidth="0.5" fill="none" />
-          </>
+          </g>
         )}
         {/* Legs */}
         {animState === 'walk' ? (
-          <>
+          <g>
             <path d="M13 38 L12 42" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M19 38 L20 42" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <path d="M13 38 L13 41" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M19 38 L19 41" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         )}
         {/* Arms */}
         {animState === 'work' ? (
-          <>
+          <g>
             <path d="M9 22 L5 24" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M23 22 L25 18" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : animState === 'talk' ? (
-          <>
+          <g>
             <path d="M9 22 L6 18" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M23 22 L26 20" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <path d="M9 22 L6 28" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M23 22 L26 28" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         )}
       </svg>
     </div>
@@ -284,18 +281,17 @@ function CreativeSVG({ color, animState, direction = 'down', size = 48 }: { colo
         <ellipse cx="13" cy="8" rx="6" ry="3" fill={color} transform="rotate(-10 13 8)" />
         {/* Eyes */}
         {direction === 'down' ? (
-          <>
+          <g>
             <circle cx="13.5" cy="13" r="1.2" fill="#333" />
             <circle cx="18.5" cy="13" r="1.2" fill="#333" />
-            {/* Star highlights in eyes */}
             <circle cx="13.2" cy="12.7" r="0.4" fill="white" />
             <circle cx="18.2" cy="12.7" r="0.4" fill="white" />
-          </>
+          </g>
         ) : direction === 'up' ? null : (
-          <>
+          <g>
             <circle cx={direction === 'right' ? '18.5' : '13.5'} cy="13" r="1.2" fill="#333" />
             <circle cx={direction === 'right' ? '18.2' : '13.2'} cy="12.7" r="0.4" fill="white" />
-          </>
+          </g>
         )}
         {/* Mouth */}
         {animState === 'talk' ? (
@@ -305,43 +301,42 @@ function CreativeSVG({ color, animState, direction = 'down', size = 48 }: { colo
         )}
         {/* Paintbrush when working */}
         {animState === 'work' && (
-          <>
+          <g>
             <path d="M26 14 L29 10 L30 11 L27 15 Z" fill="#8B6914" />
             <circle cx="29.5" cy="9.5" r="1.2" fill={color} />
-            {/* Paint splatters */}
             <circle cx="28" cy="8" r="0.5" fill="#FF6B6B" opacity="0.7" />
             <circle cx="31" cy="11" r="0.4" fill="#4ECDC4" opacity="0.6" />
             <circle cx="27" cy="12" r="0.3" fill="#FFE66D" opacity="0.8" />
-          </>
+          </g>
         )}
         {/* Legs */}
         {animState === 'walk' ? (
-          <>
+          <g>
             <path d="M13 38 L12 42" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M19 38 L20 42" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <path d="M13 38 L13 41" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M19 38 L19 41" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         )}
         {/* Arms */}
         {animState === 'work' ? (
-          <>
+          <g>
             <path d="M10 21 L7 25" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M22 21 L26 15" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : animState === 'talk' ? (
-          <>
+          <g>
             <path d="M10 21 L6 19" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M22 21 L25 18" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         ) : (
-          <>
+          <g>
             <path d="M10 21 L7 27" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
             <path d="M22 21 L25 27" stroke="#F5D6C6" strokeWidth="2.5" strokeLinecap="round" />
-          </>
+          </g>
         )}
       </svg>
     </div>

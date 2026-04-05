@@ -2,7 +2,10 @@
   "name": "agent-chat-service",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
+    "build": "tsc --esModuleInterop --skipLibCheck --moduleResolution node --target es2020 --outDir dist --module ESNext index.ts",
+    "start": "node dist/index.js",
     "dev": "bun --hot index.ts"
   },
   "dependencies": {
