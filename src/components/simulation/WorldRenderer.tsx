@@ -1,11 +1,11 @@
 'use client';
 
-import { useEffect, useRef, useCallback, useState } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
 import {
   generateMap, TILE_SIZE, MAP_COLS, MAP_ROWS, WORLD_W, WORLD_H,
-  TileType, BUILDINGS, STATION_POSITIONS,
-  getDayNightOverlay, clampCamera, screenToWorld,
-  type Camera, type Resources,
+  TileType, BUILDINGS, clampCamera, getDayNightOverlay, createMinimapCanvas,
+  TILE_WALKABLE,
+  type Camera, type Resources, type Decoration,
 } from '@/lib/game-world';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -18,9 +18,8 @@ export interface AgentEntity {
   pixelY: number;
   targetTileX: number;
   targetTileY: number;
-  path: { x: number; y: number }[];
   direction: 'down' | 'up' | 'left' | 'right';
-  animState: 'idle' | 'walk' | 'work' | 'talk' | 'summon' | 'wander';
+  animState: 'idle' | 'walk' | 'work' | 'talk' | 'wander';
   animFrame: number;
   animTimer: number;
   isMoving: boolean;
@@ -30,13 +29,12 @@ export interface AgentEntity {
   color: string;
   name: string;
   energy: number;
+  charType: 'mastermind' | 'worker' | 'reviewer' | 'creative' | 'hacker' | 'analyst';
   // Alive behaviors
   wanderTimer: number;
-  wanderCount: number;
   idleTimer: number;
   emote: string;
   emoteTimer: number;
-  charIndex: number; // which pixel-agents character to use (0-5)
 }
 
 export interface WorldRendererProps {
@@ -46,262 +44,408 @@ export interface WorldRendererProps {
   gameTick: number;
 }
 
-// ─── PERFORMANCE: Pre-rendered tile atlas ────────────────────────────────────
-// Instead of drawing 1200 individual tile images every frame, we pre-render
-// the ENTIRE static world into a single offscreen canvas and just blit it.
-
-const ATLAS_TILE_SIZE = 16; // source tiles are 16px
-const RENDER_TILE = 32; // rendered at 32px
-
-// ─── Character sprite layout from pixel-agents ─────────────────────────────
-// 7 cols: walk1,walk2,walk3,walk4, type1, type2, read
-// 4 rows: down, up, right, left
-// Frame size: 16x24 source, rendered at 48x72 (3x)
-const CHAR_FRAME_W = 16;
-const CHAR_FRAME_H = 24;
-const CHAR_SCALE = 3;
-const CHAR_RENDER_W = CHAR_FRAME_W * CHAR_SCALE; // 48
-const CHAR_RENDER_H = CHAR_FRAME_H * CHAR_SCALE; // 72
-const CHAR_COLS = 7;
-const CHAR_ROWS = 4;
+// ─── Sprite Constants ──────────────────────────────────────────────────────
+// pixel-agents frames: 16x24 each, individual PNGs
+// Sprout Lands character: 32x32 each, individual PNGs
+const CHAR_RENDER_SCALE = 3;
+const PA_FRAME_W = 16;
+const PA_FRAME_H = 24;
+const PA_RENDER_W = PA_FRAME_W * CHAR_RENDER_SCALE; // 48
+const PA_RENDER_H = PA_FRAME_H * CHAR_RENDER_SCALE; // 72
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
 export default function WorldRenderer({ agents, resources, sessionStatus, gameTick }: WorldRendererProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const staticCanvasRef = useRef<HTMLCanvasElement | null>(null); // offscreen cache
-  const staticDirtyRef = useRef(true);
+  // ALL mutable state in refs — NEVER as effect dependencies
+  const agentsRef = useRef(agents);
+  const gameTickRef = useRef(gameTick);
+  const resourcesRef = useRef(resources);
+  const sessionRef = useRef(sessionStatus);
+
+  const staticCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mapRef = useRef<TileType[][] | null>(null);
-  const decorRef = useRef<{ x: number; y: number; type: string; seed: number }[]>([]);
-  const charImagesRef = useRef<Record<string, HTMLImageElement>>({});
-  const charImagesLoadedRef = useRef(false);
+  const decorRef = useRef<Decoration[]>([]);
+  const minimapRef = useRef<HTMLCanvasElement | null>(null);
+  const minimapDirtyRef = useRef(true);
+
   const cameraRef = useRef<Camera>({ x: 0, y: 0, zoom: 1.5 });
   const dragRef = useRef({ dragging: false, startX: 0, startY: 0, camStartX: 0, camStartY: 0 });
-  const lastFrameTimeRef = useRef(0);
-  const fpsRef = useRef(60);
   const animFrameRef = useRef(0);
+  const lastFrameTimeRef = useRef(0);
+
+  // Character sprite caches (Image objects)
+  const charSpritesRef = useRef<Record<string, HTMLImageElement>>({});
+  const charSpritesLoadedRef = useRef(false);
+  const tileImgCacheRef = useRef<Record<string, HTMLImageElement>>({});
+  const tileSpritesLoadedRef = useRef(false);
+
+  // Sync props to refs (cheap, no re-renders)
+  agentsRef.current = agents;
+  gameTickRef.current = gameTick;
+  resourcesRef.current = resources;
+  sessionRef.current = sessionStatus;
 
   // ─── Generate map once ───────────────────────────────────────────────────
   useEffect(() => {
-    const map = generateMap();
-    mapRef.current = map;
-
-    const rng = (seed: number) => { let s = seed; return () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; }; };
-    const rand = rng(42);
-    const decos: typeof decorRef.current = [];
-    for (let y = 0; y < MAP_ROWS; y++) {
-      for (let x = 0; x < MAP_COLS; x++) {
-        if (map[y][x] !== TileType.GRASS && map[y][x] !== TileType.DIRT) continue;
-        let skip = false;
-        for (const b of BUILDINGS) {
-          if (x >= b.x - 1 && x <= b.x + b.w && y >= b.y - 1 && y <= b.y + b.h) skip = true;
-        }
-        if (x >= 7 && x <= 9 && (y >= 6 || y >= 21)) skip = true;
-        if (x >= 30 && x <= 32 && (y >= 6 || y >= 21)) skip = true;
-        if (skip) continue;
-        const r = rand();
-        if (r < 0.02) decos.push({ x, y, type: 'rock', seed: rand() });
-        else if (r < 0.045) decos.push({ x, y, type: 'flower', seed: rand() });
-        else if (r < 0.07) decos.push({ x, y, type: 'plant', seed: rand() });
-        else if (r < 0.085) decos.push({ x, y, type: 'bush', seed: rand() });
-      }
-    }
-    decorRef.current = decos;
+    const { tiles, decorations } = generateMap();
+    mapRef.current = tiles;
+    decorRef.current = decorations;
   }, []);
 
-  // ─── Load character sprites ──────────────────────────────────────────────
+  // ─── Load tile sprites (Sprout Lands tilesets) ───────────────────────────
   useEffect(() => {
-    const charNames = ['mastermind', 'worker', 'reviewer', 'creative', 'hacker', 'analyst'];
+    const tileSources: Record<string, string> = {
+      grass_0: '/sprites/sprout-lands/tilesets/Grass.png',
+      hills: '/sprites/sprout-lands/tilesets/Hills.png',
+      water: '/sprites/sprout-lands/tilesets/Water.png',
+      fences: '/sprites/sprout-lands/tilesets/Fences.png',
+      house: '/sprites/sprout-lands/tilesets/Wooden House.png',
+      doors: '/sprites/sprout-lands/tilesets/Doors.png',
+      dirt: '/sprites/sprout-lands/tilesets/Tilled_Dirt.png',
+    };
+
     let loaded = 0;
-    for (const name of charNames) {
+    const total = Object.keys(tileSources).length;
+
+    for (const [key, src] of Object.entries(tileSources)) {
       const img = new Image();
       img.onload = () => {
-        charImagesRef.current[name] = img;
+        tileImgCacheRef.current[key] = img;
         loaded++;
-        if (loaded >= charNames.length) charImagesLoadedRef.current = true;
+        if (loaded >= total) tileSpritesLoadedRef.current = true;
       };
       img.onerror = () => {
         loaded++;
-        if (loaded >= charNames.length) charImagesLoadedRef.current = true;
+        if (loaded >= total) tileSpritesLoadedRef.current = true;
       };
-      img.src = `/sprites/characters/pixel-agents/${name}/sheet_3x.png`;
+      img.src = src;
     }
   }, []);
 
-  // ─── Pre-render static world to offscreen canvas ─────────────────────────
-  const renderStaticWorld = useCallback((ctx: CanvasRenderingContext2D, w: number, h: number) => {
+  // ─── Load character sprites (pixel-agents) ───────────────────────────────
+  useEffect(() => {
+    const charTypes = ['mastermind', 'worker', 'reviewer', 'creative', 'hacker', 'analyst'] as const;
+    const directions = ['down', 'up', 'right', 'left'] as const;
+    const actions = ['walk1', 'walk2', 'walk3', 'walk4', 'type1', 'type2', 'read'] as const;
+
+    let loaded = 0;
+    const total = charTypes.length * directions.length * actions.length;
+
+    for (const charType of charTypes) {
+      for (const dir of directions) {
+        for (const action of actions) {
+          const key = `${charType}_${dir}_${action}`;
+          const img = new Image();
+          img.onload = () => {
+            charSpritesRef.current[key] = img;
+            loaded++;
+            if (loaded >= total) charSpritesLoadedRef.current = true;
+          };
+          img.onerror = () => {
+            loaded++;
+            if (loaded >= total) charSpritesLoadedRef.current = true;
+          };
+          img.src = `/sprites/characters/pixel-agents/${charType}/${dir}_${action}.png`;
+        }
+      }
+    }
+  }, []);
+
+  // ─── Pre-render static world ─────────────────────────────────────────────
+  const renderStaticWorld = useCallback(() => {
     const map = mapRef.current;
     if (!map) return;
 
     const canvas = document.createElement('canvas');
     canvas.width = WORLD_W;
     canvas.height = WORLD_H;
-    const sCtx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d')!;
+    const tileSprites = tileSpritesLoadedRef.current;
 
-    // Draw all tiles using simple colored rectangles (fast!)
-    const colors: Record<number, string> = {
+    // Rich tile colors (fallback when sprite tiles aren't loaded)
+    const tileColors: Record<number, string> = {
       [TileType.GRASS]: '#5a8c4a',
+      [TileType.GRASS_DARK]: '#4a7a3a',
+      [TileType.GRASS_LIGHT]: '#6a9c5a',
       [TileType.DIRT]: '#8B7355',
-      [TileType.WATER]: '#3a7bd5',
-      [TileType.FENCE]: '#6B4423',
-      [TileType.BUILDING_FLOOR]: '#9e8e7e',
-      [TileType.PATH]: '#b09070',
+      [TileType.WATER]: '#4a8ae5',
+      [TileType.WATER_DEEP]: '#2a5ba5',
+      [TileType.FENCE_H]: '#6B4423',
+      [TileType.FENCE_V]: '#6B4423',
+      [TileType.FENCE_CORNER]: '#5a3a1a',
+      [TileType.BUILDING_FLOOR]: '#a09080',
+      [TileType.PATH]: '#b89878',
+      [TileType.PATH_STONE]: '#a88868',
+      [TileType.HILL]: '#7a6a5a',
+      [TileType.TILLED]: '#7a6040',
+      [TileType.FLOWER_RED]: '#5a8c4a',
+      [TileType.FLOWER_YELLOW]: '#5a8c4a',
+      [TileType.FLOWER_BLUE]: '#5a8c4a',
+      [TileType.FLOWER_WHITE]: '#5a8c4a',
     };
 
-    // Batch all same-type tiles together (reduces fillStyle changes)
-    const tileBuckets = new Map<number, { x: number; y: number }[]>();
+    // Batch-draw tiles by color (minimizes fillStyle changes)
+    const batches = new Map<string, { x: number; y: number; w: number; h: number }[]>();
     for (let r = 0; r < MAP_ROWS; r++) {
       for (let c = 0; c < MAP_COLS; c++) {
         const t = map[r][c];
-        if (!tileBuckets.has(t)) tileBuckets.set(t, []);
-        tileBuckets.get(t)!.push({ x: c * TILE_SIZE, y: r * TILE_SIZE });
+        const color = tileColors[t] || '#5a8c4a';
+        if (!batches.has(color)) batches.set(color, []);
+        batches.get(color)!.push({ x: c * TILE_SIZE, y: r * TILE_SIZE, w: TILE_SIZE, h: TILE_SIZE });
       }
     }
-
-    // Draw each tile type as a batch
-    for (const [type, tiles] of tileBuckets) {
-      sCtx.fillStyle = colors[type] || '#5a8c4a';
-      for (const t of tiles) {
-        sCtx.fillRect(t.x, t.y, TILE_SIZE, TILE_SIZE);
-      }
+    for (const [color, rects] of batches) {
+      ctx.fillStyle = color;
+      for (const r of rects) ctx.fillRect(r.x, r.y, r.w, r.h);
     }
 
-    // Add subtle grass variation using deterministic noise
-    sCtx.fillStyle = 'rgba(0,0,0,0.03)';
+    // ── Grass texture details ──
+    // Subtle dark patches
+    ctx.fillStyle = 'rgba(0,0,0,0.04)';
     for (let r = 0; r < MAP_ROWS; r++) {
       for (let c = 0; c < MAP_COLS; c++) {
-        if (map[r][c] === TileType.GRASS) {
-          const hash = ((c * 7 + r * 13 + c * r) % 5);
-          if (hash < 2) {
-            sCtx.fillRect(c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+        const t = map[r][c];
+        if (t === TileType.GRASS || t === TileType.GRASS_LIGHT) {
+          if (((c * 7 + r * 13 + c * r) % 5) < 2) {
+            ctx.fillRect(c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+          }
+        }
+      }
+    }
+    // Subtle light patches
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    for (let r = 0; r < MAP_ROWS; r++) {
+      for (let c = 0; c < MAP_COLS; c++) {
+        const t = map[r][c];
+        if (t === TileType.GRASS || t === TileType.GRASS_DARK) {
+          if (((c * 11 + r * 3 + c * r * 7) % 8) < 2) {
+            ctx.fillRect(c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE);
           }
         }
       }
     }
 
-    // Add grass highlights
-    sCtx.fillStyle = 'rgba(255,255,255,0.04)';
-    for (let r = 0; r < MAP_ROWS; r++) {
-      for (let c = 0; c < MAP_COLS; c++) {
-        if (map[r][c] === TileType.GRASS) {
-          const hash = ((c * 11 + r * 3 + c * r * 7) % 8);
-          if (hash < 2) {
-            sCtx.fillRect(c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE);
-          }
-        }
-      }
-    }
-
-    // Draw water with animated-looking pattern
-    sCtx.fillStyle = 'rgba(255,255,255,0.08)';
+    // ── Water sparkle ──
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
     for (let r = 0; r < MAP_ROWS; r++) {
       for (let c = 0; c < MAP_COLS; c++) {
         if (map[r][c] === TileType.WATER) {
-          const hash = ((c + r) % 3);
-          if (hash === 0) {
-            sCtx.fillRect(c * TILE_SIZE + 4, r * TILE_SIZE + 4, TILE_SIZE - 8, 2);
+          if (((c + r * 3) % 4) === 0) {
+            ctx.fillRect(c * TILE_SIZE + 6, r * TILE_SIZE + 6, 8, 2);
           }
         }
       }
     }
 
-    // Draw fences
-    sCtx.fillStyle = '#5a3a1a';
+    // ── Water deep shading ──
+    ctx.fillStyle = 'rgba(0,0,50,0.15)';
     for (let r = 0; r < MAP_ROWS; r++) {
       for (let c = 0; c < MAP_COLS; c++) {
-        if (map[r][c] === TileType.FENCE) {
-          sCtx.fillRect(c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE);
-          sCtx.fillStyle = '#8B6B3A';
-          sCtx.fillRect(c * TILE_SIZE + 2, r * TILE_SIZE + 2, TILE_SIZE - 4, TILE_SIZE - 4);
-          sCtx.fillStyle = '#5a3a1a';
+        if (map[r][c] === TileType.WATER_DEEP) {
+          ctx.fillRect(c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE);
         }
       }
     }
 
-    // Draw paths with subtle stone pattern
-    sCtx.fillStyle = 'rgba(0,0,0,0.05)';
+    // ── Fence details ──
     for (let r = 0; r < MAP_ROWS; r++) {
       for (let c = 0; c < MAP_COLS; c++) {
-        if (map[r][c] === TileType.PATH) {
-          const hash = ((c * 3 + r * 7) % 6);
-          if (hash < 2) {
-            sCtx.fillRect(c * TILE_SIZE + 4, r * TILE_SIZE + 4, 6, 6);
+        const t = map[r][c];
+        if (t === TileType.FENCE_H || t === TileType.FENCE_V) {
+          const px = c * TILE_SIZE;
+          const py = r * TILE_SIZE;
+          // Post
+          ctx.fillStyle = '#5a3a1a';
+          ctx.fillRect(px + 2, py + 2, TILE_SIZE - 4, TILE_SIZE - 4);
+          // Top highlight
+          ctx.fillStyle = '#9B7B4A';
+          ctx.fillRect(px + 4, py + 3, TILE_SIZE - 8, 3);
+          // Rail
+          ctx.fillStyle = '#7B5B3A';
+          if (t === TileType.FENCE_H) {
+            ctx.fillRect(px, py + 12, TILE_SIZE, 4);
+          } else {
+            ctx.fillRect(px + 12, py, 4, TILE_SIZE);
+          }
+        }
+        if (t === TileType.FENCE_CORNER) {
+          const px = c * TILE_SIZE;
+          const py = r * TILE_SIZE;
+          ctx.fillStyle = '#5a3a1a';
+          ctx.fillRect(px + 4, py + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+          ctx.fillStyle = '#8B6B3A';
+          ctx.fillRect(px + 6, py + 6, TILE_SIZE - 12, TILE_SIZE - 12);
+        }
+      }
+    }
+
+    // ── Path details ──
+    for (let r = 0; r < MAP_ROWS; r++) {
+      for (let c = 0; c < MAP_COLS; c++) {
+        if (map[r][c] === TileType.PATH || map[r][c] === TileType.PATH_STONE) {
+          const px = c * TILE_SIZE;
+          const py = r * TILE_SIZE;
+          // Edge darkening
+          ctx.fillStyle = 'rgba(0,0,0,0.05)';
+          ctx.fillRect(px, py, TILE_SIZE, 1);
+          ctx.fillRect(px, py, 1, TILE_SIZE);
+          // Stone pebbles on path_stone
+          if (map[r][c] === TileType.PATH_STONE) {
+            ctx.fillStyle = 'rgba(160,130,100,0.4)';
+            ctx.fillRect(px + 5, py + 5, 6, 6);
+            ctx.fillRect(px + 18, py + 16, 8, 6);
           }
         }
       }
     }
 
-    // Draw building interiors
+    // ── Flower overlays ──
+    const flowerColors: Record<number, string> = {
+      [TileType.FLOWER_RED]: '#ff6b6b',
+      [TileType.FLOWER_YELLOW]: '#ffd93d',
+      [TileType.FLOWER_BLUE]: '#6bcbff',
+      [TileType.FLOWER_WHITE]: '#ffffff',
+    };
+    for (let r = 0; r < MAP_ROWS; r++) {
+      for (let c = 0; c < MAP_COLS; c++) {
+        const fc = flowerColors[map[r][c]];
+        if (fc) {
+          const px = c * TILE_SIZE + TILE_SIZE / 2;
+          const py = r * TILE_SIZE + TILE_SIZE / 2;
+          // Stem
+          ctx.fillStyle = '#2d5a27';
+          ctx.fillRect(px - 0.5, py + 2, 1, 6);
+          // Petals
+          ctx.fillStyle = fc;
+          ctx.beginPath();
+          ctx.arc(px, py - 1, 3, 0, Math.PI * 2);
+          ctx.fill();
+          // Center
+          ctx.fillStyle = '#ffd93d';
+          ctx.beginPath();
+          ctx.arc(px, py - 1, 1.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    // ── Building interiors ──
     for (const b of BUILDINGS) {
       const bx = b.x * TILE_SIZE;
       const by = b.y * TILE_SIZE;
       const bw = b.w * TILE_SIZE;
       const bh = b.h * TILE_SIZE;
-      // Darker floor inside
-      sCtx.fillStyle = b.color + '15';
-      sCtx.fillRect(bx, by, bw, bh);
+
+      // Floor
+      ctx.fillStyle = b.color + '18';
+      ctx.fillRect(bx, by, bw, bh);
+
+      // Floor tile pattern
+      ctx.fillStyle = b.color + '10';
+      for (let fy = 0; fy < b.h; fy++) {
+        for (let fx = 0; fx < b.w; fx++) {
+          if ((fx + fy) % 2 === 0) {
+            ctx.fillRect(bx + fx * TILE_SIZE, by + fy * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+          }
+        }
+      }
+
       // Border
-      sCtx.strokeStyle = b.color + '50';
-      sCtx.lineWidth = 2;
-      sCtx.strokeRect(bx + 1, by + 1, bw - 2, bh - 2);
+      ctx.strokeStyle = b.color + '60';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx + 1, by + 1, bw - 2, bh - 2);
+
+      // Inner border glow
+      ctx.strokeStyle = b.color + '20';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx + 4, by + 4, bw - 8, bh - 8);
+
       // Name
-      sCtx.fillStyle = b.color + 'AA';
-      sCtx.font = 'bold 10px monospace';
-      sCtx.textAlign = 'center';
-      sCtx.fillText(b.name.toUpperCase(), bx + bw / 2, by + bh - 6);
+      ctx.fillStyle = b.color + 'CC';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(b.name.toUpperCase(), bx + bw / 2, by + bh - 8);
+
       // Emoji
-      sCtx.font = '20px sans-serif';
-      sCtx.fillText(b.emoji, bx + bw / 2 - 10, by + 24);
-      // Desk icon
-      sCtx.fillStyle = b.color + '40';
-      sCtx.fillRect(bx + bw / 2 - 8, by + bh / 2 - 4, 16, 8);
+      ctx.font = '18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(b.emoji, bx + bw / 2, by + 22);
+
+      // Desk
+      ctx.fillStyle = b.color + '35';
+      ctx.fillRect(bx + bw / 2 - 10, by + bh / 2, 20, 8);
+      ctx.fillStyle = b.color + '25';
+      ctx.fillRect(bx + bw / 2 - 12, by + bh / 2 + 8, 4, 6);
+      ctx.fillRect(bx + bw / 2 + 8, by + bh / 2 + 8, 4, 6);
     }
 
-    // Draw decorations
+    // ── Decorations ──
     for (const deco of decorRef.current) {
       const px = deco.x * TILE_SIZE;
       const py = deco.y * TILE_SIZE;
+      const cx = px + TILE_SIZE / 2;
+      const cy = py + TILE_SIZE / 2;
+
       if (deco.type === 'rock') {
-        sCtx.fillStyle = '#888';
-        sCtx.beginPath();
-        sCtx.arc(px + TILE_SIZE / 2, py + TILE_SIZE / 2, 5, 0, Math.PI * 2);
-        sCtx.fill();
-        sCtx.fillStyle = '#aaa';
-        sCtx.beginPath();
-        sCtx.arc(px + TILE_SIZE / 2 - 1, py + TILE_SIZE / 2 - 1, 3, 0, Math.PI * 2);
-        sCtx.fill();
-      } else if (deco.type === 'flower') {
-        const colors = ['#ff6b6b', '#ffd93d', '#6bcb77', '#4d96ff'];
-        sCtx.fillStyle = colors[Math.floor(deco.seed * 4)];
-        sCtx.beginPath();
-        sCtx.arc(px + TILE_SIZE / 2, py + TILE_SIZE / 2, 3, 0, Math.PI * 2);
-        sCtx.fill();
-        sCtx.fillStyle = '#2d5a27';
-        sCtx.fillRect(px + TILE_SIZE / 2 - 0.5, py + TILE_SIZE / 2 + 2, 1, 6);
-      } else if (deco.type === 'plant') {
-        sCtx.fillStyle = '#3a7a2e';
-        sCtx.beginPath();
-        sCtx.arc(px + TILE_SIZE / 2, py + TILE_SIZE / 2, 5, 0, Math.PI * 2);
-        sCtx.fill();
-        sCtx.fillStyle = '#4a9a3e';
-        sCtx.beginPath();
-        sCtx.arc(px + TILE_SIZE / 2 - 2, py + TILE_SIZE / 2 - 2, 3, 0, Math.PI * 2);
-        sCtx.fill();
+        ctx.fillStyle = deco.variant < 2 ? '#7a7a7a' : '#8a8a8a';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + 2, 6, 4, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = deco.variant < 2 ? '#9a9a9a' : '#aaa';
+        ctx.beginPath();
+        ctx.arc(cx - 1, cy, 4, 0, Math.PI * 2);
+        ctx.fill();
+        // Highlight
+        ctx.fillStyle = 'rgba(255,255,255,0.2)';
+        ctx.beginPath();
+        ctx.arc(cx - 2, cy - 1, 2, 0, Math.PI * 2);
+        ctx.fill();
       } else if (deco.type === 'bush') {
-        sCtx.fillStyle = '#2d6a22';
-        sCtx.beginPath();
-        sCtx.ellipse(px + TILE_SIZE / 2, py + TILE_SIZE / 2, 8, 5, 0, 0, Math.PI * 2);
-        sCtx.fill();
-        sCtx.fillStyle = '#3d8a32';
-        sCtx.beginPath();
-        sCtx.ellipse(px + TILE_SIZE / 2 - 2, py + TILE_SIZE / 2 - 1, 5, 3, 0, 0, Math.PI * 2);
-        sCtx.fill();
+        ctx.fillStyle = '#2d6a22';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + 2, 9, 5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#3d8a32';
+        ctx.beginPath();
+        ctx.ellipse(cx - 2, cy, 6, 4, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#4a9a3e';
+        ctx.beginPath();
+        ctx.arc(cx - 3, cy - 1, 3, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (deco.type === 'grass_tuft') {
+        ctx.fillStyle = '#4a9a3e';
+        for (let i = -2; i <= 2; i++) {
+          ctx.fillRect(cx + i * 2 - 0.5, cy + 4, 1, 5 - Math.abs(i));
+        }
+      } else if (deco.type === 'stump') {
+        ctx.fillStyle = '#6B4423';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + 3, 5, 3, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#8B6B3A';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + 1, 5, 3, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // Rings
+        ctx.strokeStyle = '#6B4423';
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy + 1, 2, 0, Math.PI * 2);
+        ctx.stroke();
       }
     }
 
     staticCanvasRef.current = canvas;
-    staticDirtyRef.current = false;
   }, []);
+
+  // ─── Build static world after map is ready ───────────────────────────────
+  useEffect(() => {
+    if (mapRef.current && !staticCanvasRef.current) {
+      renderStaticWorld();
+    }
+  }, [renderStaticWorld]);
 
   // ─── Mouse handlers ──────────────────────────────────────────────────────
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -319,6 +463,7 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
       const cam = cameraRef.current;
       cam.x = camStartX - (e.clientX - startX) / cam.zoom;
       cam.y = camStartY - (e.clientY - startY) / cam.zoom;
+      minimapDirtyRef.current = true;
     }
   }, []);
 
@@ -331,23 +476,23 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
     const cam = cameraRef.current;
     const factor = e.deltaY < 0 ? 1.1 : 0.9;
     cam.zoom = Math.max(0.5, Math.min(3, cam.zoom * factor));
+    minimapDirtyRef.current = true;
   }, []);
 
-  // ─── Resize ──────────────────────────────────────────────────────────────
+  // ─── Canvas resize ───────────────────────────────────────────────────────
   useEffect(() => {
     const resize = () => {
       const c = canvasRef.current;
       if (!c) return;
       c.width = c.clientWidth;
       c.height = c.clientHeight;
-      staticDirtyRef.current = true;
     };
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
   }, []);
 
-  // Center camera on first load
+  // ─── Center camera ───────────────────────────────────────────────────────
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
@@ -356,9 +501,10 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
     cam.y = (WORLD_H - c.height / cam.zoom) / 2;
   }, []);
 
-  // ─── Render loop (throttled to ~30fps, uses offscreen cache) ──────────────
+  // ─── MAIN RENDER LOOP — runs once, never restarts ────────────────────────
   useEffect(() => {
     let running = true;
+    let frameCount = 0;
 
     const render = (timestamp: number) => {
       if (!running) return;
@@ -370,7 +516,7 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
         return;
       }
       lastFrameTimeRef.current = timestamp;
-      fpsRef.current = 1000 / elapsed;
+      frameCount++;
 
       const canvas = canvasRef.current;
       if (!canvas) { animFrameRef.current = requestAnimationFrame(render); return; }
@@ -379,169 +525,194 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
 
       const w = canvas.width;
       const h = canvas.height;
-      const cam = cameraRef.current;
+      const cam = clampCamera(cameraRef.current, w, h);
+      cameraRef.current = cam;
+      const tick = gameTickRef.current;
+      const currentAgents = agentsRef.current;
 
-      // Rebuild static canvas if needed
-      if (staticDirtyRef.current || !staticCanvasRef.current) {
-        renderStaticWorld(ctx, w, h);
-      }
-
-      // Clamp camera
-      const clamped = clampCamera(cam, w, h);
-      cameraRef.current = clamped;
-
+      // ── Clear ──
       ctx.clearRect(0, 0, w, h);
-      ctx.save();
-      ctx.scale(clamped.zoom, clamped.zoom);
-      ctx.translate(-clamped.x, -clamped.y);
 
-      // ── Blit pre-rendered world (single drawImage!) ──
+      // ── Background (sky color) ──
+      ctx.fillStyle = '#3a6a2a';
+      ctx.fillRect(0, 0, w, h);
+
+      ctx.save();
+      ctx.scale(cam.zoom, cam.zoom);
+      ctx.translate(-cam.x, -cam.y);
+
+      // ── Blit pre-rendered static world (single draw call!) ──
       if (staticCanvasRef.current) {
         ctx.drawImage(staticCanvasRef.current, 0, 0);
       }
 
-      // ── Draw animated water shimmer ──
+      // ── Animated water shimmer ──
       const map = mapRef.current;
       if (map) {
-        ctx.fillStyle = 'rgba(255,255,255,0.06)';
-        for (let r = 0; r < MAP_ROWS; r++) {
-          for (let c = 0; c < MAP_COLS; c++) {
-            if (map[r][c] === TileType.WATER) {
-              const shimmer = ((gameTick + c * 3 + r * 7) % 60) < 30;
-              if (shimmer) {
-                ctx.fillRect(c * TILE_SIZE + 4, r * TILE_SIZE + 8, 8, 2);
-              }
-            }
-          }
-        }
+        const viewLeft = Math.max(0, Math.floor(cam.x / TILE_SIZE) - 1);
+        const viewRight = Math.min(MAP_COLS, Math.ceil((cam.x + w / cam.zoom) / TILE_SIZE) + 1);
+        const viewTop = Math.max(0, Math.floor(cam.y / TILE_SIZE) - 1);
+        const viewBottom = Math.min(MAP_ROWS, Math.ceil((cam.y + h / cam.zoom) / TILE_SIZE) + 1);
 
-        // ── Draw swaying decorations ──
-        for (const deco of decorRef.current) {
-          if (deco.type === 'flower' || deco.type === 'plant') {
-            const sway = Math.sin(gameTick * 0.03 + deco.seed * 50) * 1.5;
-            const px = deco.x * TILE_SIZE;
-            const py = deco.y * TILE_SIZE;
-            if (deco.type === 'flower') {
-              const colors = ['#ff6b6b', '#ffd93d', '#6bcb77', '#4d96ff'];
-              ctx.fillStyle = colors[Math.floor(deco.seed * 4)];
-              ctx.beginPath();
-              ctx.arc(px + TILE_SIZE / 2 + sway, py + TILE_SIZE / 2, 3, 0, Math.PI * 2);
-              ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        for (let r = viewTop; r < viewBottom; r++) {
+          for (let c = viewLeft; c < viewRight; c++) {
+            const t = map[r][c];
+            if (t === TileType.WATER || t === TileType.WATER_DEEP) {
+              const shimmer = ((tick * 0.5 + c * 3 + r * 7) % 40) < 20;
+              if (shimmer) {
+                const px = c * TILE_SIZE;
+                const py = r * TILE_SIZE;
+                ctx.fillRect(px + 6, py + 8 + Math.sin(tick * 0.02 + c) * 2, 10, 2);
+              }
             }
           }
         }
       }
 
-      // ── Draw Characters ──
-      const sortedAgents = Object.values(agents).sort((a, b) => a.pixelY - b.pixelY);
-      const charLoaded = charImagesLoadedRef.current;
+      // ── Draw characters (sorted by Y for depth) ──
+      const sortedAgents = Object.values(currentAgents).sort((a, b) => a.pixelY - b.pixelY);
+      const spritesReady = charSpritesLoadedRef.current;
 
       for (const agent of sortedAgents) {
         const ax = agent.pixelX;
         const ay = agent.pixelY;
 
         // Cull offscreen agents
-        if (ax < clamped.x - 100 || ax > clamped.x + w / clamped.zoom + 100) continue;
-        if (ay < clamped.y - 100 || ay > clamped.y + h / clamped.zoom + 100) continue;
+        const viewW = w / cam.zoom;
+        const viewH = h / cam.zoom;
+        if (ax < cam.x - 100 || ax > cam.x + viewW + 100) continue;
+        if (ay < cam.y - 100 || ay > cam.y + viewH + 100) continue;
 
-        // Shadow
+        // ── Shadow ──
         ctx.fillStyle = 'rgba(0,0,0,0.15)';
         ctx.beginPath();
-        ctx.ellipse(ax + TILE_SIZE / 2, ay + TILE_SIZE - 2, 10, 4, 0, 0, Math.PI * 2);
+        ctx.ellipse(ax + TILE_SIZE / 2, ay + TILE_SIZE - 2, 12, 4, 0, 0, Math.PI * 2);
         ctx.fill();
 
-        // Spawn effect
+        // ── Spawn effect ──
         if (agent.spawnEffect > 0) {
           const progress = 1 - agent.spawnEffect;
-          ctx.strokeStyle = agent.color + Math.floor(agent.spawnEffect * 200).toString(16).padStart(2, '0');
+          const alpha = Math.floor(agent.spawnEffect * 180).toString(16).padStart(2, '0');
+          ctx.strokeStyle = agent.color + alpha;
           ctx.lineWidth = 2;
           ctx.beginPath();
-          ctx.arc(ax + TILE_SIZE / 2, ay + TILE_SIZE / 2, progress * 35, 0, Math.PI * 2);
+          ctx.arc(ax + TILE_SIZE / 2, ay + TILE_SIZE / 2, progress * 40, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Sparkle particles
+          for (let i = 0; i < 6; i++) {
+            const angle = (i / 6) * Math.PI * 2 + tick * 0.03;
+            const dist = progress * 30 + Math.sin(tick * 0.1 + i) * 5;
+            const sx = ax + TILE_SIZE / 2 + Math.cos(angle) * dist;
+            const sy = ay + TILE_SIZE / 2 + Math.sin(angle) * dist;
+            ctx.fillStyle = agent.color + alpha;
+            ctx.beginPath();
+            ctx.arc(sx, sy, 2, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        // ── Active glow (work/talk state) ──
+        if (agent.animState === 'work' || agent.animState === 'talk') {
+          const glowR = 24 + Math.sin(tick * 0.04) * 4;
+          ctx.fillStyle = agent.color + '15';
+          ctx.beginPath();
+          ctx.arc(ax + TILE_SIZE / 2, ay + TILE_SIZE / 2 - 10, glowR, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Pulsing ring
+          const pulseR = 20 + Math.sin(tick * 0.08) * 8;
+          ctx.strokeStyle = agent.color + '30';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(ax + TILE_SIZE / 2, ay + TILE_SIZE / 2 - 10, pulseR, 0, Math.PI * 2);
           ctx.stroke();
         }
 
-        // Active glow
-        if (agent.animState === 'work' || agent.animState === 'talk') {
-          const r = 22 + Math.sin(gameTick * 0.05) * 5;
-          ctx.fillStyle = agent.color + '18';
-          ctx.beginPath();
-          ctx.arc(ax + TILE_SIZE / 2, ay + TILE_SIZE / 2, r, 0, Math.PI * 2);
-          ctx.fill();
-        }
+        // ── Draw character sprite ──
+        const charType = agent.charType || 'worker';
+        let drawn = false;
 
-        // Draw character from pixel-agents sprite sheet
-        if (charLoaded) {
-          const charName = agent.charIndex !== undefined
-            ? ['mastermind', 'worker', 'reviewer', 'creative', 'hacker', 'analyst'][agent.charIndex] || 'mastermind'
-            : agent.agentId;
-          const charImg = charImagesRef.current[charName];
-          if (charImg && charImg.complete) {
-            // Sprite layout: 7 cols (walk1-4, type1-2, read) × 4 rows (down, up, right, left)
-            const dirRow: Record<string, number> = { down: 0, up: 1, right: 2, left: 3 };
-            let frameCol = 0;
-            if (agent.animState === 'walk' || agent.isMoving) {
-              frameCol = agent.animFrame % 4; // walk frames 0-3
-            } else if (agent.animState === 'work' || agent.animState === 'talk') {
-              frameCol = 4 + (Math.floor(gameTick / 15) % 2); // type frames 4-5
-            } else if (agent.animState === 'wander') {
-              frameCol = agent.animFrame % 4;
-            }
-
-            const row = dirRow[agent.direction] ?? 0;
-            const srcX = frameCol * CHAR_RENDER_W;
-            const srcY = row * CHAR_RENDER_H;
-
-            // Draw character centered on tile
-            const drawX = ax + (TILE_SIZE - CHAR_RENDER_W) / 2;
-            const drawY = ay - CHAR_RENDER_H + TILE_SIZE + 4;
-
-            ctx.drawImage(charImg, srcX, srcY, CHAR_RENDER_W, CHAR_RENDER_H, drawX, drawY, CHAR_RENDER_W, CHAR_RENDER_H);
+        if (spritesReady) {
+          // Determine animation frame
+          const dir = agent.direction;
+          let action = 'walk1';
+          if (agent.isMoving || agent.animState === 'walk' || agent.animState === 'wander') {
+            const walkFrames = ['walk1', 'walk2', 'walk3', 'walk4'];
+            action = walkFrames[agent.animFrame % 4];
+          } else if (agent.animState === 'work') {
+            action = Math.floor(tick / 15) % 2 === 0 ? 'type1' : 'type2';
+          } else if (agent.animState === 'talk') {
+            action = Math.floor(tick / 12) % 2 === 0 ? 'type1' : 'read';
           } else {
-            // Fallback colored circle
-            drawFallbackCharacter(ctx, agent, ax, ay);
+            action = 'walk1'; // idle frame
           }
-        } else {
-          drawFallbackCharacter(ctx, agent, ax, ay);
+
+          const spriteKey = `${charType}_${dir}_${action}`;
+          const img = charSpritesRef.current[spriteKey];
+
+          if (img && img.complete && img.naturalWidth > 0) {
+            const drawX = ax + (TILE_SIZE - PA_RENDER_W) / 2;
+            const drawY = ay - PA_RENDER_H + TILE_SIZE + 6;
+
+            // Draw at 3x scale
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(img, 0, 0, PA_FRAME_W, PA_FRAME_H, drawX, drawY, PA_RENDER_W, PA_RENDER_H);
+            ctx.imageSmoothingEnabled = true;
+            drawn = true;
+          }
         }
 
-        // Name tag
-        ctx.fillStyle = 'rgba(0,0,0,0.6)';
-        const nameText = agent.name;
+        // Fallback: pixel character
+        if (!drawn) {
+          drawFallbackChar(ctx, agent, ax, ay, tick);
+        }
+
+        // ── Name tag ──
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
         ctx.font = 'bold 7px monospace';
         ctx.textAlign = 'center';
-        const nw = ctx.measureText(nameText).width + 6;
-        const ny = ay - CHAR_RENDER_H + 2;
-        ctx.fillRect(ax + TILE_SIZE / 2 - nw / 2, ny - 7, nw, 10);
+        const nameText = agent.name;
+        const nw = ctx.measureText(nameText).width + 8;
+        const ny = ay - PA_RENDER_H + 2;
+        ctx.beginPath();
+        ctx.roundRect(ax + TILE_SIZE / 2 - nw / 2, ny - 8, nw, 11, 3);
+        ctx.fill();
+
         ctx.fillStyle = agent.color;
         ctx.fillText(nameText, ax + TILE_SIZE / 2, ny);
 
-        // Active indicator dot
+        // Role indicator
         if (agent.animState === 'work' || agent.animState === 'talk') {
-          const ds = 1 + Math.sin(gameTick * 0.1) * 0.3;
-          ctx.fillStyle = agent.color;
+          const ds = 1.2 + Math.sin(tick * 0.1) * 0.3;
+          ctx.fillStyle = agent.animState === 'work' ? '#F59E0B' : '#8B5CF6';
           ctx.beginPath();
-          ctx.arc(ax + TILE_SIZE - 2, ny - 4, 3 * ds, 0, Math.PI * 2);
+          ctx.arc(ax + TILE_SIZE - 1, ny - 4, 3 * ds, 0, Math.PI * 2);
           ctx.fill();
         }
 
-        // Speech bubble
+        // ── Speech bubble ──
         if (agent.speechBubble) {
-          drawSpeechBubble(ctx, agent, ax, ay, gameTick);
+          drawSpeechBubble(ctx, agent, ax, ay, tick);
         }
 
-        // Emote (for alive behaviors)
-        if (agent.emoteTimer > 0) {
-          ctx.font = '14px sans-serif';
+        // ── Emote ──
+        if (agent.emoteTimer > 0 && agent.emote) {
+          ctx.font = '16px sans-serif';
           ctx.textAlign = 'center';
-          const emoteY = ay - CHAR_RENDER_H - 10 - Math.sin(gameTick * 0.08) * 3;
-          ctx.fillText(agent.emote, ax + TILE_SIZE / 2, emoteY);
+          const emoteFloat = Math.sin(tick * 0.06) * 4;
+          const emoteAlpha = Math.min(1, agent.emoteTimer / 20);
+          ctx.globalAlpha = emoteAlpha;
+          ctx.fillText(agent.emote, ax + TILE_SIZE / 2, ay - PA_RENDER_H - 14 + emoteFloat);
+          ctx.globalAlpha = 1;
         }
       }
 
       ctx.restore();
 
       // ── Day/Night overlay ──
-      const dn = getDayNightOverlay(gameTick);
+      const dn = getDayNightOverlay(tick);
       if (dn.opacity > 0) {
         ctx.fillStyle = dn.color;
         ctx.globalAlpha = dn.opacity;
@@ -549,21 +720,35 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
         ctx.globalAlpha = 1;
       }
 
-      // ── Minimap ──
-      drawMinimap(ctx, map, agents, clamped, w, h, gameTick);
+      // ── Minimap (update every 15 frames to save perf) ──
+      if (map && frameCount % 15 === 0 && minimapDirtyRef.current) {
+        const agentList = Object.values(currentAgents).map(a => ({
+          pixelX: a.pixelX, pixelY: a.pixelY, color: a.color,
+        }));
+        const mm = createMinimapCanvas(map, agentList, cam, w, h);
+        if (mm) {
+          minimapRef.current = mm;
+          minimapDirtyRef.current = false;
+        }
+      }
+      if (minimapRef.current) {
+        const mm = minimapRef.current;
+        ctx.drawImage(mm, w - mm.width - 8, h - mm.height - 8);
+      }
 
-      // ── FPS counter (debug) ──
-      // ctx.fillStyle = 'rgba(255,255,255,0.5)';
-      // ctx.font = '10px monospace';
-      // ctx.textAlign = 'left';
-      // ctx.fillText(`${Math.round(fpsRef.current)}fps`, 5, h - 5);
+      // ── Vignette effect ──
+      const gradient = ctx.createRadialGradient(w / 2, h / 2, w * 0.3, w / 2, h / 2, w * 0.7);
+      gradient.addColorStop(0, 'rgba(0,0,0,0)');
+      gradient.addColorStop(1, 'rgba(0,0,0,0.25)');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, w, h);
 
       animFrameRef.current = requestAnimationFrame(render);
     };
 
     animFrameRef.current = requestAnimationFrame(render);
     return () => { running = false; cancelAnimationFrame(animFrameRef.current); };
-  }, [agents, gameTick, renderStaticWorld]);
+  }, []); // ← EMPTY deps! Loop runs once, reads from refs
 
   return (
     <canvas
@@ -580,26 +765,68 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
   );
 }
 
-// ─── Helper: Draw fallback character ────────────────────────────────────────
-function drawFallbackCharacter(ctx: CanvasRenderingContext2D, agent: AgentEntity, ax: number, ay: number) {
+// ─── Fallback character renderer ────────────────────────────────────────────
+function drawFallbackChar(
+  ctx: CanvasRenderingContext2D,
+  agent: AgentEntity,
+  ax: number,
+  ay: number,
+  tick: number,
+) {
+  const cx = ax + TILE_SIZE / 2;
+  const cy = ay + TILE_SIZE / 2;
+
+  // Body
   ctx.fillStyle = agent.color;
   ctx.beginPath();
-  ctx.arc(ax + TILE_SIZE / 2, ay + TILE_SIZE / 2 - 5, 12, 0, Math.PI * 2);
+  ctx.ellipse(cx, cy + 2, 10, 12, 0, 0, Math.PI * 2);
   ctx.fill();
+
+  // Head
   ctx.fillStyle = '#F5D6C6';
   ctx.beginPath();
-  ctx.arc(ax + TILE_SIZE / 2, ay + TILE_SIZE / 2 - 18, 7, 0, Math.PI * 2);
+  ctx.arc(cx, cy - 14, 8, 0, Math.PI * 2);
   ctx.fill();
+
+  // Eyes
+  ctx.fillStyle = '#333';
+  const blink = Math.sin(tick * 0.05) > 0.95;
+  if (!blink) {
+    ctx.fillRect(cx - 4, cy - 15, 2, 2);
+    ctx.fillRect(cx + 2, cy - 15, 2, 2);
+  } else {
+    ctx.fillRect(cx - 4, cy - 14, 2, 1);
+    ctx.fillRect(cx + 2, cy - 14, 2, 1);
+  }
+
+  // Idle bob
+  if (agent.animState === 'idle' && !agent.isMoving) {
+    const bob = Math.sin(tick * 0.03) * 1;
+    ctx.fillStyle = agent.color + '40';
+    ctx.beginPath();
+    ctx.ellipse(cx, cy + 16 + bob, 8, 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }
 
-// ─── Helper: Draw speech bubble ─────────────────────────────────────────────
-function drawSpeechBubble(ctx: CanvasRenderingContext2D, agent: AgentEntity, ax: number, ay: number, tick: number) {
-  const text = agent.speechBubble.length > 100 ? agent.speechBubble.slice(0, 97) + '...' : agent.speechBubble;
+// ─── Speech bubble renderer ────────────────────────────────────────────────
+function drawSpeechBubble(
+  ctx: CanvasRenderingContext2D,
+  agent: AgentEntity,
+  ax: number,
+  ay: number,
+  tick: number,
+) {
+  const text = agent.speechBubble.length > 120
+    ? agent.speechBubble.slice(0, 117) + '...'
+    : agent.speechBubble;
+
   ctx.font = '7px monospace';
-  const maxW = 130;
+  const maxW = 140;
   const words = text.split(' ');
   const lines: string[] = [];
   let line = '';
+
   for (const word of words) {
     const test = line + word + ' ';
     if (ctx.measureText(test).width > maxW) {
@@ -610,122 +837,56 @@ function drawSpeechBubble(ctx: CanvasRenderingContext2D, agent: AgentEntity, ax:
     }
   }
   if (line.trim()) lines.push(line.trim());
+  if (lines.length > 5) lines.length = 5;
 
-  const bubbleW = Math.min(...lines.map(l => ctx.measureText(l).width)) + 12;
-  const realW = Math.max(bubbleW, ctx.measureText(lines[0]).width + 12);
-  const bubbleH = lines.length * 10 + 8;
-  const bx = ax + TILE_SIZE / 2 - realW / 2;
-  const by = ay - CHAR_RENDER_H - bubbleH - 8;
+  // Measure bubble size
+  let maxLineW = 0;
+  for (const l of lines) {
+    maxLineW = Math.max(maxLineW, ctx.measureText(l).width);
+  }
+  const bubbleW = maxLineW + 14;
+  const bubbleH = lines.length * 10 + 10;
+  const bubbleX = ax + TILE_SIZE / 2 - bubbleW / 2;
+  const bubbleY = ay - PA_RENDER_H - bubbleH - 12;
 
   // Background
-  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
   ctx.beginPath();
-  ctx.roundRect(bx, by, realW, bubbleH, 4);
+  ctx.roundRect(bubbleX, bubbleY, bubbleW, bubbleH, 5);
   ctx.fill();
 
-  // Border
-  ctx.strokeStyle = agent.color + '40';
+  // Colored accent border
+  ctx.strokeStyle = agent.color + '50';
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.roundRect(bx, by, realW, bubbleH, 4);
+  ctx.roundRect(bubbleX, bubbleY, bubbleW, bubbleH, 5);
   ctx.stroke();
 
   // Tail
-  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
   ctx.beginPath();
-  ctx.moveTo(ax + TILE_SIZE / 2 - 4, by + bubbleH);
-  ctx.lineTo(ax + TILE_SIZE / 2, by + bubbleH + 5);
-  ctx.lineTo(ax + TILE_SIZE / 2 + 4, by + bubbleH);
+  ctx.moveTo(ax + TILE_SIZE / 2 - 5, bubbleY + bubbleH);
+  ctx.lineTo(ax + TILE_SIZE / 2, bubbleY + bubbleH + 6);
+  ctx.lineTo(ax + TILE_SIZE / 2 + 5, bubbleY + bubbleH);
   ctx.fill();
 
   // Text
-  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
   ctx.textAlign = 'left';
   for (let i = 0; i < lines.length; i++) {
-    ctx.fillText(lines[i], bx + 6, by + 9 + i * 10);
+    ctx.fillText(lines[i], bubbleX + 7, bubbleY + 10 + i * 10);
   }
 
-  // Cursor for active speech
+  // Blinking cursor for active speech
   if (agent.animState === 'talk' || agent.animState === 'work') {
-    const lastLineWidth = ctx.measureText(lines[lines.length - 1]).width;
-    ctx.fillStyle = agent.color;
-    const cursorVisible = Math.sin(tick * 0.15) > 0;
-    if (cursorVisible) {
-      ctx.fillRect(bx + 6 + lastLineWidth, by + 9 + (lines.length - 1) * 10 - 6, 5, 7);
+    const lastLineW = ctx.measureText(lines[lines.length - 1]).width;
+    if (Math.sin(tick * 0.15) > 0) {
+      ctx.fillStyle = agent.color;
+      ctx.fillRect(
+        bubbleX + 7 + lastLineW,
+        bubbleY + 10 + (lines.length - 1) * 10 - 6,
+        5, 7,
+      );
     }
   }
-}
-
-// ─── Helper: Draw minimap ───────────────────────────────────────────────────
-function drawMinimap(
-  ctx: CanvasRenderingContext2D,
-  map: TileType[][] | null,
-  agents: Record<string, AgentEntity>,
-  cam: Camera,
-  w: number,
-  h: number,
-  tick: number,
-) {
-  if (!map) return;
-
-  const scale = 2.5;
-  const mmW = MAP_COLS * scale;
-  const mmH = MAP_ROWS * scale;
-  const mx = w - mmW - 8;
-  const my = h - mmH - 8;
-
-  // Background
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(mx - 2, my - 2, mmW + 4, mmH + 4);
-
-  // Tiles (simple colors)
-  const colors: Record<number, string> = {
-    [TileType.GRASS]: '#5a8c4a',
-    [TileType.DIRT]: '#8B7355',
-    [TileType.WATER]: '#3a7bd5',
-    [TileType.FENCE]: '#6B4423',
-    [TileType.BUILDING_FLOOR]: '#9e8e7e',
-    [TileType.PATH]: '#b09070',
-  };
-
-  for (let r = 0; r < MAP_ROWS; r++) {
-    for (let c = 0; c < MAP_COLS; c++) {
-      ctx.fillStyle = colors[map[r][c]] || '#5a8c4a';
-      ctx.fillRect(mx + c * scale, my + r * scale, scale, scale);
-    }
-  }
-
-  // Buildings
-  for (const b of BUILDINGS) {
-    ctx.fillStyle = b.color + '80';
-    ctx.fillRect(mx + b.x * scale, my + b.y * scale, b.w * scale, b.h * scale);
-  }
-
-  // Agents
-  for (const agent of Object.values(agents)) {
-    ctx.fillStyle = agent.color;
-    ctx.fillRect(
-      mx + (agent.pixelX / TILE_SIZE) * scale - 1.5,
-      my + (agent.pixelY / TILE_SIZE) * scale - 1.5,
-      3, 3,
-    );
-  }
-
-  // Viewport rect
-  const vpX = mx + (cam.x / TILE_SIZE) * scale;
-  const vpY = my + (cam.y / TILE_SIZE) * scale;
-  const vpW = (w / cam.zoom / TILE_SIZE) * scale;
-  const vpH = (h / cam.zoom / TILE_SIZE) * scale;
-  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(vpX, vpY, vpW, vpH);
-
-  // Time label
-  const dn = getDayNightOverlay(tick);
-  ctx.fillStyle = 'rgba(0,0,0,0.5)';
-  ctx.fillRect(mx, my - 14, 45, 12);
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.font = '7px monospace';
-  ctx.textAlign = 'left';
-  ctx.fillText(dn.phase, mx + 3, my - 5);
 }

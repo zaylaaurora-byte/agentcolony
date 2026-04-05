@@ -1,7 +1,8 @@
-// ─── Game World Engine ─────────────────────────────────────────────────────
-// Core simulation: tilemap, buildings, pathfinding, resources, day/night cycle
+// ─── Game World Engine v3 ─────────────────────────────────────────────────
+// Optimized tilemap with Sprout Lands tileset support
+// Uses real tile images for beautiful rendering
 
-export const TILE_SIZE = 32; // Render size
+export const TILE_SIZE = 32;
 export const MAP_COLS = 40;
 export const MAP_ROWS = 30;
 export const WORLD_W = MAP_COLS * TILE_SIZE;
@@ -10,20 +11,45 @@ export const WORLD_H = MAP_ROWS * TILE_SIZE;
 // ─── Tile Types ─────────────────────────────────────────────────────────────
 export enum TileType {
   GRASS = 0,
-  DIRT = 1,
-  WATER = 2,
-  FENCE = 3,
-  BUILDING_FLOOR = 4,
-  PATH = 5,
+  GRASS_DARK = 1,
+  GRASS_LIGHT = 2,
+  DIRT = 3,
+  WATER = 4,
+  WATER_DEEP = 5,
+  FENCE_H = 6,       // horizontal fence
+  FENCE_V = 7,       // vertical fence
+  FENCE_CORNER = 8,
+  BUILDING_FLOOR = 9,
+  PATH = 10,
+  PATH_STONE = 11,
+  HILL = 12,
+  TILLED = 13,
+  FLOWER_RED = 14,
+  FLOWER_YELLOW = 15,
+  FLOWER_BLUE = 16,
+  FLOWER_WHITE = 17,
 }
 
-export const TILE_WALKABLE: Record<TileType, boolean> = {
+// Which tile types are walkable
+export const TILE_WALKABLE: Record<number, boolean> = {
   [TileType.GRASS]: true,
+  [TileType.GRASS_DARK]: true,
+  [TileType.GRASS_LIGHT]: true,
   [TileType.DIRT]: true,
   [TileType.WATER]: false,
-  [TileType.FENCE]: false,
+  [TileType.WATER_DEEP]: false,
+  [TileType.FENCE_H]: false,
+  [TileType.FENCE_V]: false,
+  [TileType.FENCE_CORNER]: false,
   [TileType.BUILDING_FLOOR]: true,
   [TileType.PATH]: true,
+  [TileType.PATH_STONE]: true,
+  [TileType.HILL]: false,
+  [TileType.TILLED]: true,
+  [TileType.FLOWER_RED]: true,
+  [TileType.FLOWER_YELLOW]: true,
+  [TileType.FLOWER_BLUE]: true,
+  [TileType.FLOWER_WHITE]: true,
 };
 
 // ─── Buildings ──────────────────────────────────────────────────────────────
@@ -31,143 +57,164 @@ export interface Building {
   id: string;
   name: string;
   emoji: string;
-  x: number; // tile col (top-left)
-  y: number; // tile row (top-left)
-  w: number; // width in tiles
-  h: number; // height in tiles
+  x: number;
+  y: number;
+  w: number;
+  h: number;
   color: string;
 }
 
 export const BUILDINGS: Building[] = [
-  { id: 'planning-desk', name: 'Planning Desk', emoji: '📋', x: 2, y: 2, w: 4, h: 3, color: '#8B5CF6' },
-  { id: 'workbench', name: 'Workshop', emoji: '🔧', x: 34, y: 2, w: 4, h: 3, color: '#F97316' },
-  { id: 'review-desk', name: 'QA Lab', emoji: '🔍', x: 2, y: 25, w: 4, h: 3, color: '#10B981' },
-  { id: 'creative-studio', name: 'Studio', emoji: '🎨', x: 34, y: 25, w: 4, h: 3, color: '#EC4899' },
+  { id: 'planning-desk', name: 'Planning', emoji: '📋', x: 1, y: 1, w: 5, h: 4, color: '#8B5CF6' },
+  { id: 'workbench', name: 'Workshop', emoji: '🔧', x: 34, y: 1, w: 5, h: 4, color: '#F97316' },
+  { id: 'review-desk', name: 'QA Lab', emoji: '🔍', x: 1, y: 25, w: 5, h: 4, color: '#10B981' },
+  { id: 'creative-studio', name: 'Studio', emoji: '🎨', x: 34, y: 25, w: 5, h: 4, color: '#EC4899' },
+  { id: 'town-hall', name: 'Town Hall', emoji: '🏛️', x: 17, y: 12, w: 6, h: 5, color: '#F59E0B' },
 ];
 
-// Station positions (where agents walk to when using a building)
 export const STATION_POSITIONS: Record<string, { x: number; y: number }> = {
-  'planning-desk': { x: 4, y: 5 },
-  workbench: { x: 36, y: 5 },
-  'review-desk': { x: 4, y: 27 },
-  'creative-studio': { x: 36, y: 27 },
+  'planning-desk': { x: 3, y: 6 },
+  'workbench': { x: 36, y: 6 },
+  'review-desk': { x: 3, y: 30 },
+  'creative-studio': { x: 36, y: 30 },
+  'town-hall': { x: 20, y: 18 },
   idle: { x: 20, y: 15 },
   center: { x: 20, y: 15 },
 };
 
+// ─── Decorations ────────────────────────────────────────────────────────────
+export interface Decoration {
+  x: number;
+  y: number;
+  type: 'rock' | 'bush' | 'grass_tuft' | 'stump';
+  variant: number; // 0-3 for different looks
+}
+
+// ─── Deterministic RNG ──────────────────────────────────────────────────────
+function createRNG(seed: number) {
+  let s = seed;
+  return () => {
+    s = (s * 16807) % 2147483647;
+    return (s - 1) / 2147483646;
+  };
+}
+
 // ─── Generate Map ───────────────────────────────────────────────────────────
-export function generateMap(): TileType[][] {
-  const map: TileType[][] = [];
+export function generateMap(): { tiles: TileType[][]; decorations: Decoration[] } {
+  const tiles: TileType[][] = [];
+  const rng = createRNG(42);
+  const decorations: Decoration[] = [];
 
   for (let y = 0; y < MAP_ROWS; y++) {
     const row: TileType[] = [];
     for (let x = 0; x < MAP_COLS; x++) {
-      // Start with grass
       let tile = TileType.GRASS;
 
-      // Water pond in top-right area
-      const wx = x - 28, wy = y - 12;
-      if (wx * wx / 9 + wy * wy / 6 < 1) tile = TileType.WATER;
+      // Grass variation
+      const grassHash = ((x * 7 + y * 13 + x * y) % 10);
+      if (grassHash < 2) tile = TileType.GRASS_DARK;
+      else if (grassHash < 4) tile = TileType.GRASS_LIGHT;
 
-      // Dirt paths connecting buildings
-      // Horizontal path through middle
-      if (y === 7 && x >= 2 && x <= 38) tile = TileType.PATH;
-      if (y === 22 && x >= 2 && x <= 38) tile = TileType.PATH;
-      // Vertical paths
-      if (x === 8 && y >= 2 && y <= 28) tile = TileType.PATH;
-      if (x === 31 && y >= 2 && y <= 28) tile = TileType.PATH;
-      // Center crossroad
+      // ── Water pond (top-right area) ──
+      const wx = x - 30, wy = y - 8;
+      const waterDist = wx * wx / 12 + wy * wy / 8;
+      if (waterDist < 1) {
+        tile = waterDist < 0.4 ? TileType.WATER_DEEP : TileType.WATER;
+      }
+
+      // ── Dirt paths ──
+      // Main horizontal paths
+      if (y === 6 && x >= 1 && x <= 39) tile = TileType.PATH;
+      if (y === 23 && x >= 1 && x <= 39) tile = TileType.PATH;
+      // Main vertical paths
+      if (x === 8 && y >= 1 && y <= 29) tile = TileType.PATH;
+      if (x === 31 && y >= 1 && y <= 29) tile = TileType.PATH;
+      // Center crossroad (wider)
       if ((x >= 8 && x <= 31) && (y === 14 || y === 15)) tile = TileType.PATH;
+      // Path to town hall
+      if (x >= 17 && x <= 22 && (y === 11 || y === 17)) tile = TileType.PATH;
 
-      // Building floors
+      // Stone details on paths
+      const pathHash = ((x * 3 + y * 7) % 8);
+      if (tile === TileType.PATH && pathHash < 2) tile = TileType.PATH_STONE;
+
+      // ── Building floors ──
       for (const b of BUILDINGS) {
         if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
           tile = TileType.BUILDING_FLOOR;
         }
       }
 
-      // Fences around buildings (1 tile border)
-      for (const b of BUILDINGS) {
-        const bx = x - b.x, by = y - b.y;
-        if (bx >= -1 && bx <= b.w && by >= -1 && by <= b.h) {
-          const onEdge = bx === -1 || bx === b.w || by === -1 || by === b.h;
-          const onCorner = (bx === -1 && (by === -1 || by === b.h)) || (bx === b.w && (by === -1 || by === b.h));
-          if (onEdge && !onCorner && tile !== TileType.BUILDING_FLOOR) {
-            // Don't place fence on path intersections
-            if (tile !== TileType.PATH) tile = TileType.FENCE;
+      // ── Fences around buildings ──
+      if (tile !== TileType.BUILDING_FLOOR && tile !== TileType.PATH && tile !== TileType.PATH_STONE) {
+        for (const b of BUILDINGS) {
+          const bx = x - b.x, by = y - b.y;
+          // Check if adjacent to building
+          if (bx >= -1 && bx <= b.w && by >= -1 && by <= b.h) {
+            const onEdge = (bx === -1 || bx === b.w) && (by >= -1 && by <= b.h) ||
+                           (by === -1 || by === b.h) && (bx >= -1 && bx <= b.w);
+            const onCorner = (bx === -1 || bx === b.w) && (by === -1 || by === b.h);
+            if (onEdge && !onCorner) {
+              // Determine fence direction
+              if (by === -1 || by === b.h) {
+                tile = TileType.FENCE_H;
+              } else {
+                tile = TileType.FENCE_V;
+              }
+            }
+            if (onCorner) {
+              tile = TileType.FENCE_CORNER;
+            }
           }
         }
       }
 
-      // Dirt around water
-      const wx2 = x - 28, wy2 = y - 12;
-      if (tile === TileType.GRASS && wx2 * wx2 / 16 + wy2 * wy2 / 10 < 1 && wx2 * wx2 / 9 + wy2 * wy2 / 6 >= 1) {
+      // ── Dirt border around water ──
+      const wx2 = x - 30, wy2 = y - 8;
+      const dirtDist = wx2 * wx2 / 16 + wy2 * wy2 / 10;
+      if (dirtDist < 1 && waterDist >= 1) {
         tile = TileType.DIRT;
+      }
+
+      // ── Flowers (sparse) ──
+      const flowerRng = rng();
+      if (tile === TileType.GRASS || tile === TileType.GRASS_DARK || tile === TileType.GRASS_LIGHT) {
+        if (flowerRng < 0.008) tile = TileType.FLOWER_RED;
+        else if (flowerRng < 0.016) tile = TileType.FLOWER_YELLOW;
+        else if (flowerRng < 0.022) tile = TileType.FLOWER_BLUE;
+        else if (flowerRng < 0.026) tile = TileType.FLOWER_WHITE;
       }
 
       row.push(tile);
     }
-    map.push(row);
+    tiles.push(row);
   }
 
-  return map;
-}
+  // ── Decorations ──
+  for (let y = 0; y < MAP_ROWS; y++) {
+    for (let x = 0; x < MAP_COLS; x++) {
+      const t = tiles[y][x];
+      if (t !== TileType.GRASS && t !== TileType.GRASS_DARK && t !== TileType.GRASS_LIGHT) continue;
 
-// ─── Pathfinding (BFS) ─────────────────────────────────────────────────────
-export function findPath(
-  map: TileType[][],
-  startX: number, startY: number,
-  endX: number, endY: number
-): { x: number; y: number }[] {
-  if (startX === endX && startY === endY) return [];
-
-  const cols = map[0].length;
-  const rows = map.length;
-
-  // Clamp to walkable
-  if (!TILE_WALKABLE[map[endY]?.[endX] ?? TileType.GRASS]) {
-    // Find nearest walkable tile to end
-    let best = null, bestDist = Infinity;
-    for (let dy = -3; dy <= 3; dy++) {
-      for (let dx = -3; dx <= 3; dx++) {
-        const nx = endX + dx, ny = endY + dy;
-        if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && TILE_WALKABLE[map[ny][nx]]) {
-          const d = dx * dx + dy * dy;
-          if (d < bestDist) { bestDist = d; best = { x: nx, y: ny }; }
-        }
+      // Skip near buildings, paths, water
+      let skip = false;
+      for (const b of BUILDINGS) {
+        if (x >= b.x - 2 && x <= b.x + b.w + 1 && y >= b.y - 2 && y <= b.y + b.h + 1) skip = true;
       }
-    }
-    if (best) { endX = best.x; endY = best.y; }
-    else return [];
-  }
+      if (x >= 7 && x <= 9) skip = true;
+      if (x >= 30 && x <= 32) skip = true;
+      if (y === 6 || y === 14 || y === 15 || y === 23) skip = true;
+      if (skip) continue;
 
-  const visited = new Set<string>();
-  const queue: { x: number; y: number; path: { x: number; y: number }[] }[] = [];
-  queue.push({ x: startX, y: startY, path: [] });
-  visited.add(`${startX},${startY}`);
-
-  const dirs = [
-    { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
-    { dx: 0, dy: 1 }, { dx: 0, dy: -1 },
-  ];
-
-  while (queue.length > 0) {
-    const curr = queue.shift()!;
-    for (const { dx, dy } of dirs) {
-      const nx = curr.x + dx, ny = curr.y + dy;
-      const key = `${nx},${ny}`;
-      if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
-      if (visited.has(key)) continue;
-      if (!TILE_WALKABLE[map[ny][nx]]) continue;
-      visited.add(key);
-
-      const newPath = [...curr.path, { x: nx, y: ny }];
-      if (nx === endX && ny === endY) return newPath;
-      queue.push({ x: nx, y: ny, path: newPath });
+      const r = rng();
+      if (r < 0.015) decorations.push({ x, y, type: 'rock', variant: Math.floor(rng() * 4) });
+      else if (r < 0.035) decorations.push({ x, y, type: 'bush', variant: Math.floor(rng() * 4) });
+      else if (r < 0.05) decorations.push({ x, y, type: 'grass_tuft', variant: Math.floor(rng() * 4) });
+      else if (r < 0.055) decorations.push({ x, y, type: 'stump', variant: Math.floor(rng() * 4) });
     }
   }
 
-  return []; // No path found
+  return { tiles, decorations };
 }
 
 // ─── Resources ──────────────────────────────────────────────────────────────
@@ -197,30 +244,21 @@ export function createInitialResources(): Resources {
   };
 }
 
-export function applyResourceDelta(res: Resources, delta: Partial<Resources>): Resources {
-  return { ...res, ...delta };
-}
-
 // ─── Day/Night Cycle ───────────────────────────────────────────────────────
 export function getDayNightOverlay(gameTick: number): { color: string; opacity: number; phase: string } {
-  const cycle = 1200; // ticks per full day
-  const t = (gameTick % cycle) / cycle; // 0-1
+  const cycle = 1200;
+  const t = (gameTick % cycle) / cycle;
 
-  if (t < 0.25) {
-    // Dawn
-    const f = t / 0.25;
-    return { color: '#FF8C00', opacity: Math.max(0, 0.15 * (1 - f)), phase: 'Dawn' };
+  if (t < 0.2) {
+    return { color: '#FF8C00', opacity: Math.max(0, 0.12 * (1 - t / 0.2)), phase: '🌅 Dawn' };
   } else if (t < 0.5) {
-    // Day
-    return { color: '#000000', opacity: 0, phase: 'Day' };
-  } else if (t < 0.75) {
-    // Dusk
-    const f = (t - 0.5) / 0.25;
-    return { color: '#1a1a4e', opacity: 0.12 * f, phase: 'Dusk' };
+    return { color: '#000000', opacity: 0, phase: '☀️ Day' };
+  } else if (t < 0.7) {
+    const f = (t - 0.5) / 0.2;
+    return { color: '#1a1a4e', opacity: 0.1 * f, phase: '🌇 Dusk' };
   } else {
-    // Night
-    const f = (t - 0.75) / 0.25;
-    return { color: '#0a0a2e', opacity: 0.12 + 0.08 * Math.sin(f * Math.PI), phase: 'Night' };
+    const f = (t - 0.7) / 0.3;
+    return { color: '#0a0a2e', opacity: 0.1 + 0.06 * Math.sin(f * Math.PI), phase: '🌙 Night' };
   }
 }
 
@@ -242,16 +280,100 @@ export function clampCamera(cam: Camera, canvasW: number, canvasH: number): Came
   };
 }
 
-export function screenToWorld(sx: number, sy: number, cam: Camera): { x: number; y: number } {
-  return {
-    x: (sx / cam.zoom) + cam.x,
-    y: (sy / cam.zoom) + cam.y,
-  };
-}
+// ─── Pre-rendered minimap ──────────────────────────────────────────────────
+export function createMinimapCanvas(
+  tiles: TileType[][],
+  agents: { pixelX: number; pixelY: number; color: string }[],
+  cam: Camera,
+  canvasW: number,
+  canvasH: number,
+): HTMLCanvasElement | null {
+  const scale = 2.5;
+  const mmW = MAP_COLS * scale;
+  const mmH = MAP_ROWS * scale;
+  const padding = 10;
 
-export function worldToScreen(wx: number, wy: number, cam: Camera): { x: number; y: number } {
-  return {
-    x: (wx - cam.x) * cam.zoom,
-    y: (wy - cam.y) * cam.zoom,
+  const canvas = document.createElement('canvas');
+  canvas.width = mmW + padding * 2;
+  canvas.height = mmH + padding * 2 + 16;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const ox = padding;
+  const oy = padding + 16;
+
+  // Background
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.beginPath();
+  ctx.roundRect(0, 0, canvas.width, canvas.height, 6);
+  ctx.fill();
+
+  // Phase label
+  const dn = getDayNightOverlay(0);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = 'bold 8px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(dn.phase, ox, oy - 5);
+
+  // Tile colors
+  const tileColors: Record<number, string> = {
+    [TileType.GRASS]: '#5a8c4a',
+    [TileType.GRASS_DARK]: '#4a7a3a',
+    [TileType.GRASS_LIGHT]: '#6a9c5a',
+    [TileType.DIRT]: '#8B7355',
+    [TileType.WATER]: '#3a7bd5',
+    [TileType.WATER_DEEP]: '#2a5ba5',
+    [TileType.FENCE_H]: '#6B4423',
+    [TileType.FENCE_V]: '#6B4423',
+    [TileType.FENCE_CORNER]: '#6B4423',
+    [TileType.BUILDING_FLOOR]: '#9e8e7e',
+    [TileType.PATH]: '#b09070',
+    [TileType.PATH_STONE]: '#a08060',
+    [TileType.HILL]: '#7a6a5a',
+    [TileType.TILLED]: '#7a6040',
+    [TileType.FLOWER_RED]: '#5a8c4a',
+    [TileType.FLOWER_YELLOW]: '#5a8c4a',
+    [TileType.FLOWER_BLUE]: '#5a8c4a',
+    [TileType.FLOWER_WHITE]: '#5a8c4a',
   };
+
+  // Batch draw tiles
+  const batches = new Map<string, { x: number; y: number }[]>();
+  for (let r = 0; r < MAP_ROWS; r++) {
+    for (let c = 0; c < MAP_COLS; c++) {
+      const color = tileColors[tiles[r][c]] || '#5a8c4a';
+      if (!batches.has(color)) batches.set(color, []);
+      batches.get(color)!.push({ x: ox + c * scale, y: oy + r * scale });
+    }
+  }
+  for (const [color, pts] of batches) {
+    ctx.fillStyle = color;
+    for (const p of pts) ctx.fillRect(p.x, p.y, scale, scale);
+  }
+
+  // Buildings
+  for (const b of BUILDINGS) {
+    ctx.fillStyle = b.color + '60';
+    ctx.fillRect(ox + b.x * scale, oy + b.y * scale, b.w * scale, b.h * scale);
+    ctx.strokeStyle = b.color + '80';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(ox + b.x * scale, oy + b.y * scale, b.w * scale, b.h * scale);
+  }
+
+  // Agents
+  for (const a of agents) {
+    ctx.fillStyle = a.color;
+    ctx.fillRect(ox + (a.pixelX / TILE_SIZE) * scale - 1, oy + (a.pixelY / TILE_SIZE) * scale - 1, 3, 3);
+  }
+
+  // Viewport
+  const vpX = ox + (cam.x / TILE_SIZE) * scale;
+  const vpY = oy + (cam.y / TILE_SIZE) * scale;
+  const vpW = (canvasW / cam.zoom / TILE_SIZE) * scale;
+  const vpH = (canvasH / cam.zoom / TILE_SIZE) * scale;
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(vpX, vpY, vpW, vpH);
+
+  return canvas;
 }
