@@ -12,9 +12,11 @@ import { AGENT_CONFIG, type AgentId, type AgentMessage, type Task } from '@/lib/
 import WorldRenderer, { type AgentEntity } from '@/components/simulation/WorldRenderer';
 import ResourceBar from '@/components/simulation/ResourceBar';
 import {
-  createInitialResources, STATION_POSITIONS,
-  type Resources, TILE_SIZE, MAP_COLS, MAP_ROWS,
-} from '@/lib/game-world';
+  TILE_SIZE, MAP_COLS, MAP_ROWS,
+  createAgent,
+  STATION_POSITIONS,
+  type CharSkin, type Direction, type AgentState,
+} from '@/lib/game-engine';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -22,6 +24,46 @@ import { cn } from '@/lib/utils';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 type SessionStatus = 'idle' | 'running' | 'paused' | 'complete' | 'error';
+
+// ─── Convert game agent to entity for renderer ─────────────────────────────
+function agentToEntity(id: string, agent: {
+  name: string;
+  skin: CharSkin;
+  spriteSet: 'pixel-agents' | 'sprout-lands';
+  color: string;
+  tileX: number;
+  tileY: number;
+  state: AgentState;
+  direction: Direction;
+  animFrame: number;
+  isMoving: boolean;
+  speechBubble: string;
+  speechTimer: number;
+  emote: string;
+  emoteTimer: number;
+  spawnTimer: number;
+  energy: number;
+}): AgentEntity {
+  return {
+    agentId: id,
+    name: agent.name,
+    charType: agent.skin,
+    spriteSet: agent.spriteSet,
+    color: agent.color,
+    x: agent.tileX,
+    y: agent.tileY,
+    state: agent.state,
+    direction: agent.direction,
+    animFrame: agent.animFrame,
+    isMoving: agent.isMoving,
+    speechBubble: agent.speechBubble,
+    speechTimer: agent.speechTimer,
+    emote: agent.emote,
+    emoteTimer: agent.emoteTimer,
+    spawnEffect: agent.spawnTimer > 0 ? agent.spawnTimer / 0.4 : 0,
+    energy: agent.energy,
+  };
+}
 
 // ─── Main Component ────────────────────────────────────────────────────────
 export default function Home() {
@@ -33,158 +75,186 @@ export default function Home() {
   const [input, setInput] = useState('');
   const [goal, setGoal] = useState('');
   const [showChat, setShowChat] = useState(false);
-  const [resources, setResources] = useState<Resources>(createInitialResources());
-  const [summonedAgents, setSummonedAgents] = useState<string[]>([]);
 
-  // Game state in refs for performance (avoid re-renders from game loop)
-  const gameTickRef = useRef(0);
-  const agentsRef = useRef<Record<string, AgentEntity>>({});
-  const [gameTick, setGameTick] = useState(0); // trigger canvas re-read
+  // Resources
+  const [resources, setResources] = useState({
+    money: 1000, population: 1, totalEnergy: 100,
+    tasksCompleted: 0, tasksFailed: 0, iteration: 0,
+    maxIterations: 20, qualityScore: 0, qualityThreshold: 8,
+  });
+
+  // Game state in refs (no re-renders from game loop!)
+  const gameAgentsRef = useRef<Map<string, any>>(new Map());
   const [agentEntities, setAgentEntities] = useState<Record<string, AgentEntity>>({});
+  const gameTickRef = useRef(0);
+  const [gameTick, setGameTick] = useState(0);
 
-  // ─── Game Tick Loop (drives animation & agent movement) ──────────────────
-  // This runs at 20fps and updates agent positions via refs
+  // ─── Game Update Loop (runs at ~20fps, updates agent behaviors) ──────────
   useEffect(() => {
     const TICK_MS = 50;
+    let lastTime = performance.now();
 
     const interval = setInterval(() => {
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.1);
+      lastTime = now;
+
       gameTickRef.current++;
       const tick = gameTickRef.current;
-      let agentsChanged = false;
+      let changed = false;
 
-      const agents = agentsRef.current;
-      const keys = Object.keys(agents);
-      if (keys.length === 0) {
-        // Just tick
-        if (tick % 3 === 0) setGameTick(tick); // throttle React updates
+      const agents = gameAgentsRef.current;
+      if (agents.size === 0) {
+        if (tick % 6 === 0) setGameTick(tick);
         return;
       }
 
-      // Copy-on-write: only create new object if something changed
-      const updated: Record<string, AgentEntity> = {};
+      const newEntities: Record<string, AgentEntity> = {};
 
-      for (const agentId of keys) {
-        const a = agents[agentId];
-        const speed = 1.8;
+      for (const [id, agent] of agents) {
+        // ── Movement ──
+        if (agent.path.length > 0 && agent.pathIndex < agent.path.length) {
+          const speed = 3; // tiles per second
+          agent.moveProgress += speed * dt;
 
-        // ── Movement toward target ──
-        const targetPx = a.targetTileX * TILE_SIZE;
-        const targetPy = a.targetTileY * TILE_SIZE;
-        const dx = targetPx - a.pixelX;
-        const dy = targetPy - a.pixelY;
-        const dist = Math.sqrt(dx * dx + dy * dy);
+          while (agent.moveProgress >= 1 && agent.pathIndex < agent.path.length - 1) {
+            agent.moveProgress -= 1;
+            agent.pathIndex++;
+          }
 
-        if (dist > 1.5) {
-          const moveX = (dx / dist) * Math.min(speed, dist);
-          const moveY = (dy / dist) * Math.min(speed, dist);
+          if (agent.pathIndex < agent.path.length) {
+            const prev = agent.pathIndex > 0 ? agent.path[agent.pathIndex - 1] : { x: agent.tileX, y: agent.tileY };
+            const next = agent.path[agent.pathIndex];
+            const t = Math.min(agent.moveProgress, 1);
 
-          updated[agentId] = {
-            ...a,
-            pixelX: a.pixelX + moveX,
-            pixelY: a.pixelY + moveY,
-            tileX: Math.round((a.pixelX + moveX) / TILE_SIZE),
-            tileY: Math.round((a.pixelY + moveY) / TILE_SIZE),
-            isMoving: true,
-            direction: Math.abs(dx) > Math.abs(dy)
+            agent.tileX = prev.x + (next.x - prev.x) * t;
+            agent.tileY = prev.y + (next.y - prev.y) * t;
+
+            // Direction
+            const dx = next.x - prev.x;
+            const dy = next.y - prev.y;
+            agent.direction = Math.abs(dx) > Math.abs(dy)
               ? (dx > 0 ? 'right' : 'left')
-              : (dy > 0 ? 'down' : 'up'),
-            animTimer: a.animTimer + 1,
-            animFrame: (a.animTimer + 1 > 8) ? ((a.animFrame + 1) % 4) : a.animFrame,
-          };
-          agentsChanged = true;
-        } else if (a.isMoving) {
-          // Arrived at destination
-          updated[agentId] = {
-            ...a,
-            pixelX: targetPx,
-            pixelY: targetPy,
-            tileX: a.targetTileX,
-            tileY: a.targetTileY,
-            isMoving: false,
-            animFrame: 0,
-            animTimer: 0,
-            animState: a.animState === 'wander' ? 'idle' : a.animState,
-          };
-          agentsChanged = true;
+              : (dy > 0 ? 'down' : 'up');
+
+            // Walk animation
+            agent.animTimer += dt;
+            if (agent.animTimer >= 0.15) {
+              agent.animTimer -= 0.15;
+              agent.animFrame = (agent.animFrame + 1) % 4;
+            }
+            agent.isMoving = true;
+            changed = true;
+          }
+
+          // Check arrival
+          if (agent.pathIndex >= agent.path.length - 1 && agent.moveProgress >= 1) {
+            const dest = agent.path[agent.path.length - 1];
+            agent.tileX = dest.x;
+            agent.tileY = dest.y;
+            agent.path = [];
+            agent.pathIndex = 0;
+            agent.moveProgress = 0;
+            agent.isMoving = false;
+
+            if (agent.isActive) {
+              agent.state = 'type';
+              agent.animTimer = 0;
+            } else {
+              agent.state = 'idle';
+              agent.wanderTimer = 2 + Math.random() * 6;
+              agent.idleTimer = 0;
+            }
+            changed = true;
+          }
+        } else {
+          agent.isMoving = false;
         }
 
-        const current = updated[agentId] || a;
-
-        // ── Speech bubble countdown ──
-        if (current.speechTimer > 0) {
-          updated[agentId] = {
-            ...current,
-            speechTimer: current.speechTimer - 1,
-            ...(current.speechTimer - 1 <= 0
-              ? { speechBubble: '', animState: current.isMoving ? 'walk' : 'idle' }
-              : {}),
-          };
-          agentsChanged = true;
+        // ── Type/Read animation ──
+        if (agent.state === 'type' || agent.state === 'read') {
+          agent.animTimer += dt;
+          if (agent.animTimer >= 0.3) {
+            agent.animTimer -= 0.3;
+            agent.animFrame = agent.animFrame === 0 ? 1 : 0;
+          }
+          if (!agent.isActive) {
+            agent.idleTimer += dt;
+            if (agent.idleTimer > 1) {
+              agent.state = 'idle';
+              agent.idleTimer = 0;
+              agent.wanderTimer = 2 + Math.random() * 6;
+            }
+          }
+          changed = true;
         }
 
-        // ── Emote countdown ──
-        if (current.emoteTimer > 0) {
-          const newEmote = current.emoteTimer - 1;
-          updated[agentId] = {
-            ...updated[agentId] || current,
-            emoteTimer: newEmote,
-            emote: newEmote > 0 ? current.emote : '',
-          };
-          agentsChanged = true;
-        }
+        // ── Idle behavior ──
+        if (agent.state === 'idle') {
+          agent.idleTimer += dt;
 
-        // ── Spawn effect fade ──
-        if (current.spawnEffect > 0) {
-          const newSpawn = Math.max(0, current.spawnEffect - 0.015);
-          updated[agentId] = {
-            ...updated[agentId] || current,
-            spawnEffect: newSpawn,
-          };
-          agentsChanged = true;
-        }
-
-        // ── Alive behaviors (idle only) ──
-        const latest = updated[agentId] || current;
-        if (!latest.isMoving && (latest.animState === 'idle') && latest.speechTimer <= 0 && latest.spawnEffect <= 0) {
-          const newIdle = latest.idleTimer + 1;
-          const newWander = latest.wanderTimer - 1;
-          let changes: Partial<AgentEntity> = { idleTimer: newIdle, wanderTimer: newWander };
-
-          // Random emote when standing around
-          if (newIdle > 80 && latest.emoteTimer <= 0) {
+          // Random emote
+          agent.emoteInterval -= dt;
+          if (agent.emoteInterval <= 0) {
             const emotes = ['💭', '💤', '🎵', '👀', '✨', '🤔', '😄', '😎'];
-            changes.emote = emotes[Math.floor(Math.random() * emotes.length)];
-            changes.emoteTimer = 50 + Math.floor(Math.random() * 50);
-            changes.idleTimer = 0;
+            agent.emote = emotes[Math.floor(Math.random() * emotes.length)];
+            agent.emoteTimer = 2 + Math.random() * 3;
+            agent.emoteInterval = 4 + Math.random() * 8;
+            changed = true;
           }
 
-          // Wander randomly
-          if (newWander <= 0) {
-            const wanderRange = 5;
-            const newTx = latest.tileX + Math.floor(Math.random() * wanderRange * 2) - wanderRange;
-            const newTy = latest.tileY + Math.floor(Math.random() * wanderRange * 2) - wanderRange;
-            changes.targetTileX = Math.max(1, Math.min(MAP_COLS - 2, newTx));
-            changes.targetTileY = Math.max(1, Math.min(MAP_ROWS - 2, newTy));
-            changes.animState = 'wander';
-            changes.wanderTimer = 80 + Math.floor(Math.random() * 200);
+          // Wander
+          agent.wanderTimer -= dt;
+          if (agent.wanderTimer <= 0) {
+            const range = 6;
+            const tx = Math.max(2, Math.min(MAP_COLS - 3, Math.round(agent.tileX + (Math.random() - 0.5) * range * 2)));
+            const ty = Math.max(2, Math.min(MAP_ROWS - 3, Math.round(agent.tileY + (Math.random() - 0.5) * range * 2)));
+            agent.targetTileX = tx;
+            agent.targetTileY = ty;
+            agent.state = 'walk';
+            agent.animTimer = 0;
+            agent.animFrame = 0;
+            // Simple path: just go to target
+            agent.path = [{ x: tx, y: ty }];
+            agent.pathIndex = 0;
+            agent.moveProgress = 0;
+            agent.wanderTimer = 3 + Math.random() * 10;
+            changed = true;
           }
 
-          updated[agentId] = { ...latest, ...changes };
-          agentsChanged = true;
+          // Reactivate
+          if (agent.isActive) {
+            agent.state = 'walk';
+            changed = true;
+          }
         }
+
+        // ── Timers ──
+        if (agent.spawnTimer > 0) {
+          agent.spawnTimer = Math.max(0, agent.spawnTimer - dt);
+          changed = true;
+        }
+        if (agent.speechTimer > 0) {
+          agent.speechTimer -= dt;
+          if (agent.speechTimer <= 0) agent.speechBubble = '';
+          changed = true;
+        }
+        if (agent.emoteTimer > 0) {
+          agent.emoteTimer -= dt;
+          if (agent.emoteTimer <= 0) agent.emote = '';
+          changed = true;
+        }
+
+        newEntities[id] = agentToEntity(id, agent);
       }
 
-      // Apply updates
-      if (agentsChanged) {
-        agentsRef.current = { ...agentsRef.current, ...updated };
-      }
-
-      // Throttle React state updates to ~10fps (canvas reads from refs anyway)
-      if (tick % 2 === 0) {
-        setGameTick(tick);
-        // Only update React state periodically for UI that needs it
-        if (tick % 6 === 0) {
-          setAgentEntities({ ...agentsRef.current });
+      // Throttle React updates
+      if (changed) {
+        if (tick % 2 === 0) {
+          setGameTick(tick);
+          if (tick % 4 === 0) {
+            setAgentEntities(newEntities);
+          }
         }
       }
     }, TICK_MS);
@@ -192,23 +262,7 @@ export default function Home() {
     return () => clearInterval(interval);
   }, []);
 
-  // ─── Move Agent Helper ────────────────────────────────────────────────────
-  const moveAgentTo = useCallback((agentId: string, targetX: number, targetY: number) => {
-    const a = agentsRef.current[agentId];
-    if (!a) return;
-    agentsRef.current = {
-      ...agentsRef.current,
-      [agentId]: {
-        ...a,
-        targetTileX: Math.max(0, Math.min(MAP_COLS - 1, targetX)),
-        targetTileY: Math.max(0, Math.min(MAP_ROWS - 1, targetY)),
-        animState: 'walk',
-      },
-    };
-    setAgentEntities({ ...agentsRef.current });
-  }, []);
-
-  // ─── Socket Connection ────────────────────────────────────────────────────
+  // ─── Socket Connection ──────────────────────────────────────────────────
   useEffect(() => {
     const socket = io('/?XTransformPort=3004', {
       transports: ['websocket', 'polling'],
@@ -224,49 +278,33 @@ export default function Home() {
     socket.on('session-init', (data: any) => {
       const posMap: Record<string, { x: number; y: number }> = {
         mastermind: { x: 4, y: 6 },
-        worker: { x: 36, y: 6 },
-        reviewer: { x: 4, y: 24 },
-        creative: { x: 36, y: 24 },
+        worker: { x: 35, y: 6 },
+        reviewer: { x: 4, y: 28 },
+        creative: { x: 35, y: 28 },
         hacker: { x: 20, y: 10 },
         analyst: { x: 20, y: 20 },
       };
 
-      const entities: Record<string, AgentEntity> = {};
-      const charTypeMap: Record<string, AgentEntity['charType']> = {
+      const charTypeMap: Record<string, CharSkin> = {
         mastermind: 'mastermind', worker: 'worker', reviewer: 'reviewer',
         creative: 'creative', hacker: 'hacker', analyst: 'analyst',
       };
 
+      gameAgentsRef.current = new Map();
+      const entities: Record<string, AgentEntity> = {};
+
       for (const agentId of (data.agents || ['mastermind', 'worker'])) {
         const pos = posMap[agentId] || { x: 20, y: 15 };
         const config = AGENT_CONFIG[agentId as AgentId];
-        entities[agentId] = {
-          agentId,
-          tileX: pos.x, tileY: pos.y,
-          pixelX: pos.x * TILE_SIZE, pixelY: pos.y * TILE_SIZE,
-          targetTileX: pos.x, targetTileY: pos.y,
-          direction: 'down',
-          animState: 'idle',
-          animFrame: 0,
-          animTimer: 0,
-          isMoving: false,
-          speechBubble: '',
-          speechTimer: 0,
-          spawnEffect: 1.0,
-          color: config?.color ?? '#888',
-          name: config?.name ?? agentId,
-          energy: 100,
-          charType: charTypeMap[agentId] || 'worker',
-          wanderTimer: 60 + Math.random() * 120,
-          idleTimer: 0,
-          emote: '👋',
-          emoteTimer: 80,
-        };
+        const skin = charTypeMap[agentId] || 'worker';
+
+        const agent = createAgent(agentId, config?.name ?? agentId, skin, config?.color ?? '#888', pos.x, pos.y);
+
+        gameAgentsRef.current.set(agentId, agent);
+        entities[agentId] = agentToEntity(agentId, agent);
       }
 
-      agentsRef.current = entities;
       setAgentEntities(entities);
-      setSummonedAgents([]);
       setResources(prev => ({
         ...prev,
         population: Object.keys(entities).length,
@@ -279,94 +317,86 @@ export default function Home() {
       store.addMessage(msg);
       store.clearStream(msg.agentId);
 
-      // Update speech bubble
-      const a = agentsRef.current[msg.agentId];
-      if (a) {
-        agentsRef.current = {
-          ...agentsRef.current,
-          [msg.agentId]: {
-            ...a,
-            speechBubble: msg.content.slice(0, 150),
-            speechTimer: 180,
-            animState: 'talk',
-          },
-        };
-        setAgentEntities({ ...agentsRef.current });
-      }
+      const agent = gameAgentsRef.current.get(msg.agentId);
+      if (agent) {
+        agent.speechBubble = msg.content.slice(0, 150);
+        agent.speechTimer = 5;
+        agent.state = 'type';
+        agent.animTimer = 0;
+        agent.isActive = false; // Will go idle after grace period
 
-      if (msg.role === 'executor') {
-        setResources(prev => ({
-          ...prev,
-          money: prev.money - 10,
-          tasksCompleted: prev.tasksCompleted + 1,
-          totalEnergy: Math.max(0, prev.totalEnergy - 5),
-        }));
+        if (msg.role === 'executor') {
+          setResources(prev => ({
+            ...prev,
+            money: prev.money - 10,
+            tasksCompleted: prev.tasksCompleted + 1,
+            totalEnergy: Math.max(0, prev.totalEnergy - 5),
+          }));
+        }
       }
     });
 
     socket.on('agent-stream', ({ agentId, chunk }: { agentId: string; chunk: string }) => {
       store.appendStream(agentId, chunk);
 
-      const a = agentsRef.current[agentId];
-      if (a) {
-        agentsRef.current = {
-          ...agentsRef.current,
-          [agentId]: {
-            ...a,
-            speechBubble: (a.speechBubble || '').length > 120
-              ? chunk
-              : (a.speechBubble || '') + chunk,
-            speechTimer: 180,
-            animState: 'work',
-          },
-        };
+      const agent = gameAgentsRef.current.get(agentId);
+      if (agent) {
+        const existing = agent.speechBubble || '';
+        agent.speechBubble = existing.length > 100 ? chunk : existing + chunk;
+        agent.speechTimer = 5;
+        agent.state = 'type';
+        agent.isActive = true;
+        agent.animTimer = 0;
       }
     });
 
     socket.on('agent-move', ({ agentId, targetX, targetY, station }: any) => {
-      const stationPos = STATION_POSITIONS[station];
-      if (stationPos) {
-        moveAgentTo(agentId, stationPos.x, stationPos.y);
-      } else {
-        moveAgentTo(agentId, targetX, targetY);
+      const agent = gameAgentsRef.current.get(agentId);
+      if (!agent) return;
+
+      let tx = targetX, ty = targetY;
+      if (station && STATION_POSITIONS[station]) {
+        tx = STATION_POSITIONS[station].x;
+        ty = STATION_POSITIONS[station].y;
       }
+
+      agent.targetTileX = tx;
+      agent.targetTileY = ty;
+      agent.path = [{ x: tx, y: ty }];
+      agent.pathIndex = 0;
+      agent.moveProgress = 0;
+      agent.state = 'walk';
+      agent.animTimer = 0;
+      agent.animFrame = 0;
+      agent.isActive = true; // Mark as active so it stays at destination
     });
 
-    socket.on('agent-summoned', ({ agentId, name, position }: any) => {
+    socket.on('agent-summoned', ({ agentId, name }: any) => {
       const config = AGENT_CONFIG[agentId as AgentId];
-      const pos = position
-        ? { x: position.x / (100 / MAP_COLS), y: position.y / (100 / MAP_ROWS) }
-        : { x: 15 + Math.random() * 10, y: 12 + Math.random() * 6 };
+      const skins: CharSkin[] = ['worker', 'reviewer', 'creative', 'hacker', 'analyst'];
+      const skin = skins[gameAgentsRef.current.size % skins.length];
 
-      const charTypes: AgentEntity['charType'][] = ['worker', 'reviewer', 'creative', 'hacker', 'analyst', 'mastermind'];
-
-      const newAgent: AgentEntity = {
+      const spawnPos = { x: 15 + Math.random() * 10, y: 12 + Math.random() * 6 };
+      const agent = createAgent(
         agentId,
-        tileX: Math.round(pos.x), tileY: Math.round(pos.y),
-        pixelX: pos.x * TILE_SIZE, pixelY: pos.y * TILE_SIZE,
-        targetTileX: Math.round(pos.x), targetTileY: Math.round(pos.y),
-        direction: 'down',
-        animState: 'idle',
-        animFrame: 0,
-        animTimer: 0,
-        isMoving: false,
-        speechBubble: '✨ Summoned!',
-        speechTimer: 120,
-        spawnEffect: 1.0,
-        color: config?.color ?? '#888',
-        name: config?.name ?? name ?? agentId,
-        energy: 100,
-        charType: charTypes[Object.keys(agentsRef.current).length % charTypes.length],
-        wanderTimer: 80 + Math.random() * 100,
-        idleTimer: 0,
-        emote: '🤩',
-        emoteTimer: 60,
-      };
+        config?.name ?? name ?? agentId,
+        skin,
+        config?.color ?? '#888',
+        Math.round(spawnPos.x),
+        Math.round(spawnPos.y),
+      );
 
-      agentsRef.current = { ...agentsRef.current, [agentId]: newAgent };
-      setAgentEntities({ ...agentsRef.current });
+      agent.speechBubble = '✨ Summoned!';
+      agent.speechTimer = 3;
+      agent.emote = '🤩';
+      agent.emoteTimer = 3;
 
-      setSummonedAgents(prev => [...prev, agentId]);
+      gameAgentsRef.current.set(agentId, agent);
+      setAgentEntities(prev => ({
+        ...prev,
+        [agentId]: agentToEntity(agentId, agent),
+      }));
+
       setResources(prev => ({
         ...prev,
         population: prev.population + 1,
@@ -391,9 +421,9 @@ export default function Home() {
     socket.on('session-status', ({ status }: { status: string }) => {
       store.setSessionStatus(status as SessionStatus);
       if (status === 'complete' || status === 'error') {
-        // Move all agents to center
-        for (const id of Object.keys(agentsRef.current)) {
-          moveAgentTo(id, 20, 15);
+        for (const [id, agent] of gameAgentsRef.current) {
+          agent.isActive = false;
+          agent.state = 'idle';
         }
       }
     });
@@ -408,9 +438,9 @@ export default function Home() {
     });
 
     return () => { socket.disconnect(); };
-  }, [moveAgentTo, store]);
+  }, [store]);
 
-  // ─── Auto-scroll chat ────────────────────────────────────────────────────
+  // ─── Auto-scroll chat ──────────────────────────────────────────────────
   useEffect(() => {
     chatScrollRef.current?.scrollTo({
       top: chatScrollRef.current.scrollHeight,
@@ -418,14 +448,17 @@ export default function Home() {
     });
   }, [messages, streamingContent]);
 
-  // ─── Handlers ─────────────────────────────────────────────────────────────
+  // ─── Handlers ──────────────────────────────────────────────────────────
   const handleStart = useCallback(() => {
     if (!socketRef.current || !goal.trim()) return;
     store.clearSession();
-    setSummonedAgents([]);
-    agentsRef.current = {};
+    gameAgentsRef.current = new Map();
     setAgentEntities({});
-    setResources(createInitialResources());
+    setResources({
+      money: 1000, population: 1, totalEnergy: 100,
+      tasksCompleted: 0, tasksFailed: 0, iteration: 0,
+      maxIterations: 20, qualityScore: 0, qualityThreshold: 8,
+    });
     socketRef.current.emit('start-session', { goal: goal.trim(), agents: selectedAgents });
   }, [goal, selectedAgents, store]);
 
@@ -435,10 +468,13 @@ export default function Home() {
     if (sessionStatus === 'idle') {
       setGoal(trimmed);
       store.clearSession();
-      setSummonedAgents([]);
-      agentsRef.current = {};
+      gameAgentsRef.current = new Map();
       setAgentEntities({});
-      setResources(createInitialResources());
+      setResources({
+        money: 1000, population: 1, totalEnergy: 100,
+        tasksCompleted: 0, tasksFailed: 0, iteration: 0,
+        maxIterations: 20, qualityScore: 0, qualityThreshold: 8,
+      });
       socketRef.current.emit('start-session', { goal: trimmed, agents: selectedAgents });
     } else {
       socketRef.current.emit('user-message', { message: trimmed });
@@ -452,10 +488,13 @@ export default function Home() {
   const handleReset = () => {
     store.clearSession();
     setGoal('');
-    setSummonedAgents([]);
-    agentsRef.current = {};
+    gameAgentsRef.current = new Map();
     setAgentEntities({});
-    setResources(createInitialResources());
+    setResources({
+      money: 1000, population: 1, totalEnergy: 100,
+      tasksCompleted: 0, tasksFailed: 0, iteration: 0,
+      maxIterations: 20, qualityScore: 0, qualityThreshold: 8,
+    });
   };
 
   const isRunning = sessionStatus === 'running';
@@ -768,7 +807,7 @@ export default function Home() {
           <span className="text-[10px] font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-orange-400 bg-clip-text text-transparent">
             AgentColony
           </span>
-          <span className="text-[8px] text-white/15">v3.0</span>
+          <span className="text-[8px] text-white/15">v4.0</span>
         </div>
       </div>
     </div>
