@@ -1,14 +1,15 @@
 'use client';
 
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import {
   GameState, TILE_SIZE, MAP_COLS, MAP_ROWS, WORLD_W, WORLD_H,
   Agent, AgentState, Direction, CharSkin, DEFAULT_ZOOM,
   TileType, BUILDINGS, isWalkable,
 } from '@/lib/game-engine';
+import { getDayNightOverlay } from '@/lib/game-world';
 import {
   loadAllSprites, onSpritesLoaded, getSpriteForAgent,
-  getCachedSprite, getSpriteDimensions, isReady,
+  getSpriteDimensions, isReady,
 } from '@/lib/sprite-cache';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -83,6 +84,14 @@ const FLOWER_COLORS: Record<number, string> = {
   [TileType.FLOWER_WHITE]: '#ffffff',
 };
 
+// ─── Activity labels for tooltip ──────────────────────────────────────────────
+const ACTIVITY_LABELS: Record<string, string> = {
+  idle: 'Relaxing',
+  walk: 'Moving',
+  type: 'Typing...',
+  read: 'Reading...',
+};
+
 // ─── Main Component ──────────────────────────────────────────────────────────
 
 export default function WorldRenderer({ agents, resources, sessionStatus, gameTick }: WorldRendererProps) {
@@ -96,14 +105,19 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
   const spritesReadyRef = useRef(false);
   const gameTimeRef = useRef(0);
   const minimapRef = useRef<HTMLCanvasElement | null>(null);
-  const minimapTimerRef = useRef(0);
+  const minimapDirtyRef = useRef(true);
+  const mouseWorldRef = useRef({ x: 0, y: 0, screenX: 0, screenY: 0 });
+  const hoveredAgentRef = useRef<string | null>(null);
+
+  // React state for tooltip (updated at low frequency)
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; name: string; role: string; activity: string; color: string } | null>(null);
 
   // ─── Initialize game state ─────────────────────────────────────────────────
   useEffect(() => {
     const gs = new GameState();
     gameRef.current = gs;
 
-    // Center camera
+    // Center camera on the map
     cameraRef.current.x = (WORLD_W - 800) / 2;
     cameraRef.current.y = (WORLD_H - 600) / 2;
   }, []);
@@ -112,7 +126,6 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
   useEffect(() => {
     loadAllSprites().then(() => {
       spritesReadyRef.current = true;
-      // Rebuild static world when sprites are ready (for better tile rendering)
       buildStaticWorld();
     });
   }, []);
@@ -144,7 +157,7 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
       for (const p of pts) ctx.fillRect(p.x, p.y, TILE_SIZE, TILE_SIZE);
     }
 
-    // Grass texture (subtle variation)
+    // Grass texture variation
     ctx.fillStyle = 'rgba(0,0,0,0.04)';
     for (let r = 0; r < MAP_ROWS; r++) {
       for (let c = 0; c < MAP_COLS; c++) {
@@ -309,12 +322,12 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
     }
 
     staticWorldRef.current = canvas;
+    minimapDirtyRef.current = true;
   }, []);
 
   // Build static world once tiles are ready
   useEffect(() => {
     if (gameRef.current && !staticWorldRef.current) {
-      // Small delay to ensure game state is initialized
       const timer = setTimeout(buildStaticWorld, 50);
       return () => clearTimeout(timer);
     }
@@ -354,6 +367,24 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
       cam.x = camStartX - (e.clientX - startX) / cam.zoom;
       cam.y = camStartY - (e.clientY - startY) / cam.zoom;
     }
+
+    // Track mouse position in world coords (for hover detection)
+    const c = canvasRef.current;
+    if (!c) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssX = e.clientX - c.getBoundingClientRect().left;
+    const cssY = e.clientY - c.getBoundingClientRect().top;
+    const cam = cameraRef.current;
+    const viewW = c.clientWidth;
+    const viewH = c.clientHeight;
+    const offsetX = (viewW - WORLD_W * cam.zoom) / 2;
+    const offsetY = (viewH - WORLD_H * cam.zoom) / 2;
+    mouseWorldRef.current = {
+      x: (cssX - offsetX) / cam.zoom + cam.x,
+      y: (cssY - offsetY) / cam.zoom + cam.y,
+      screenX: e.clientX,
+      screenY: e.clientY,
+    };
   }, []);
 
   const handleMouseUp = useCallback(() => {
@@ -370,11 +401,12 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
   // ─── Main Render Loop — runs ONCE, never restarts (pixel-agents pattern) ──
   useEffect(() => {
     let running = true;
+    let tooltipCheckCounter = 0;
 
     const render = (timestamp: number) => {
       if (!running) return;
 
-      // Delta time (capped at 100ms to prevent spiral of death)
+      // Delta time (capped at 100ms)
       const dt = lastTimeRef.current === 0 ? 0 : Math.min((timestamp - lastTimeRef.current) / 1000, 0.1);
       lastTimeRef.current = timestamp;
       gameTimeRef.current += dt;
@@ -408,14 +440,13 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
       ctx.scale(dpr, dpr);
       ctx.imageSmoothingEnabled = false;
 
-      // Pixel-perfect offset
       const offsetX = Math.floor((w / dpr - WORLD_W * cam.zoom) / 2);
       const offsetY = Math.floor((h / dpr - WORLD_H * cam.zoom) / 2);
       ctx.translate(offsetX, offsetY);
       ctx.scale(cam.zoom, cam.zoom);
       ctx.translate(-cam.x, -cam.y);
 
-      // ── Blit static world (single drawImage call!) ──
+      // ── Blit static world ──
       if (staticWorldRef.current) {
         ctx.drawImage(staticWorldRef.current, 0, 0);
       }
@@ -444,9 +475,12 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
         }
       }
 
-      // ── Draw Agents (z-sorted by Y, like pixel-agents) ──
+      // ── Draw Agents (z-sorted by Y, like pixel-agents renderScene) ──
       const agentList = Object.values(agents);
       const sorted = [...agentList].sort((a, b) => a.y - b.y);
+
+      // Track which agent the mouse is hovering over
+      let newHovered: string | null = null;
 
       for (const agent of sorted) {
         // Cull offscreen
@@ -455,13 +489,22 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
         if (ax < cam.x - 80 || ax > cam.x + viewW + 80) continue;
         if (ay < cam.y - 80 || ay > cam.y + viewH + 80) continue;
 
+        // ── Hit test for hover ──
+        const mw = mouseWorldRef.current;
+        const hitW = 12;
+        const hitH = 18;
+        if (mw.x >= ax - hitW && mw.x <= ax + TILE_SIZE + hitW &&
+            mw.y >= ay - hitH && mw.y <= ay + TILE_SIZE) {
+          newHovered = agent.agentId;
+        }
+
         // ── Shadow ──
         ctx.fillStyle = 'rgba(0,0,0,0.2)';
         ctx.beginPath();
         ctx.ellipse(ax + TILE_SIZE / 2, ay + TILE_SIZE - 1, 6, 2, 0, 0, Math.PI * 2);
         ctx.fill();
 
-        // ── Spawn effect (matrix-style sweep) ──
+        // ── Spawn effect ──
         if (agent.spawnEffect > 0) {
           drawSpawnEffect(ctx, ax + TILE_SIZE / 2, ay + TILE_SIZE / 2, agent.spawnEffect, gt, agent.color);
         }
@@ -475,6 +518,15 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
           ctx.fill();
         }
 
+        // ── Selection/hover outline ──
+        if (hoveredAgentRef.current === agent.agentId) {
+          ctx.strokeStyle = agent.color;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 2]);
+          ctx.strokeRect(ax - 1, ay - 4, TILE_SIZE + 2, TILE_SIZE + 4);
+          ctx.setLineDash([]);
+        }
+
         // ── Draw character sprite ──
         const drawn = drawCharacter(ctx, agent, gt);
         if (!drawn) {
@@ -482,7 +534,7 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
         }
 
         // ── Name tag ──
-        drawNameTag(ctx, agent, ax, ay);
+        drawNameTag(ctx, agent, ax, ay, gt);
 
         // ── Speech bubble ──
         if (agent.speechBubble) {
@@ -501,13 +553,23 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
         }
       }
 
+      hoveredAgentRef.current = newHovered;
+
+      // ── Day/Night cycle overlay ──
+      const dayNight = getDayNightOverlay(gt);
+      if (dayNight.opacity > 0) {
+        ctx.fillStyle = dayNight.color;
+        ctx.globalAlpha = dayNight.opacity;
+        ctx.fillRect(cam.x - 10, cam.y - 10, viewW + 20, viewH + 20);
+        ctx.globalAlpha = 1;
+      }
+
       ctx.restore();
 
-      // ── Minimap (update every 2s) ──
-      minimapTimerRef.current += dt;
-      if (gs && minimapTimerRef.current > 2) {
-        minimapTimerRef.current = 0;
-        minimapRef.current = renderMinimap(gs, agentList, cam, w / dpr, h / dpr);
+      // ── Minimap (cached, updates when dirty) ──
+      if (gs && minimapDirtyRef.current) {
+        minimapRef.current = buildMinimap(gs, agentList, cam, w / dpr, h / dpr);
+        minimapDirtyRef.current = false;
       }
       if (minimapRef.current) {
         ctx.save();
@@ -526,6 +588,28 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
       ctx.fillRect(0, 0, w / dpr, h / dpr);
       ctx.restore();
 
+      // ── Tooltip (update at low frequency via React state) ──
+      tooltipCheckCounter++;
+      if (tooltipCheckCounter % 10 === 0) {
+        if (newHovered) {
+          const a = agents[newHovered];
+          if (a) {
+            setTooltip({
+              x: a.x,
+              y: a.y,
+              name: a.name,
+              role: ACTIVITY_LABELS[a.state] || a.state,
+              activity: a.speechBubble ? a.speechBubble.slice(0, 60) + (a.speechBubble.length > 60 ? '...' : '') : '',
+              color: a.color,
+            });
+          } else {
+            setTooltip(null);
+          }
+        } else {
+          setTooltip(prev => prev ? null : prev); // Only clear if there was one
+        }
+      }
+
       animFrameRef.current = requestAnimationFrame(render);
     };
 
@@ -534,17 +618,48 @@ export default function WorldRenderer({ agents, resources, sessionStatus, gameTi
   }, []); // ← EMPTY deps! Loop runs once, reads from refs/props
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="w-full h-full block cursor-grab active:cursor-grabbing"
-      style={{ imageRendering: 'pixelated' }}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
-      onWheel={handleWheel}
-      onContextMenu={(e) => e.preventDefault()}
-    />
+    <div className="relative w-full h-full">
+      <canvas
+        ref={canvasRef}
+        className="w-full h-full block cursor-grab active:cursor-grabbing"
+        style={{ imageRendering: 'pixelated' }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onWheel={handleWheel}
+        onContextMenu={(e) => e.preventDefault()}
+      />
+      {/* ── Hover Tooltip ── */}
+      {tooltip && (
+        <div
+          className="absolute pointer-events-none z-30"
+          style={{
+            left: '50%',
+            bottom: 12,
+            transform: 'translateX(-50%)',
+          }}
+        >
+          <div
+            className="px-3 py-1.5 rounded-lg border backdrop-blur-md"
+            style={{
+              backgroundColor: 'rgba(0,0,0,0.85)',
+              borderColor: tooltip.color + '60',
+            }}
+          >
+            <div className="flex items-center gap-1.5">
+              <div className="w-2 h-2 rounded-full" style={{ backgroundColor: tooltip.color }} />
+              <span className="text-[10px] font-bold" style={{ color: tooltip.color }}>{tooltip.name}</span>
+              <span className="text-[9px] text-white/40">·</span>
+              <span className="text-[9px] text-white/60">{tooltip.role}</span>
+            </div>
+            {tooltip.activity && (
+              <p className="text-[8px] text-white/40 mt-0.5 max-w-48 truncate">&quot;{tooltip.activity}&quot;</p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -556,12 +671,23 @@ function drawCharacter(
 ): boolean {
   if (!isReady()) return false;
 
+  // Use game-time-based animation frame for walk cycle (4 frames)
+  let animFrame = agent.animFrame;
+  if (agent.state === 'walk' || agent.isMoving) {
+    // Smooth walk cycle: 4 frames at ~6fps
+    animFrame = Math.floor(gt * 6) % 4;
+  } else if (agent.state === 'type') {
+    animFrame = Math.floor(gt * 3) % 2;
+  } else if (agent.state === 'read') {
+    animFrame = 0;
+  }
+
   const img = getSpriteForAgent(
     agent.charType,
     agent.spriteSet,
-    agent.state,
+    agent.state === 'idle' ? 'idle' : agent.state,
     agent.direction,
-    agent.isMoving ? Math.floor(gt * 8) % 4 : 0,
+    animFrame,
   );
 
   if (!img || !img.complete || img.naturalWidth === 0) return false;
@@ -570,7 +696,6 @@ function drawCharacter(
   const ax = agent.x * TILE_SIZE;
   const ay = agent.y * TILE_SIZE;
 
-  // Draw pixel-art sprite (no smoothing!)
   ctx.imageSmoothingEnabled = false;
 
   // Center sprite horizontally, anchor at feet
@@ -584,7 +709,6 @@ function drawCharacter(
     ctx.globalAlpha = 1 - agent.spawnEffect;
     ctx.drawImage(img, drawX, drawY, dims.w, dims.h);
     ctx.globalAlpha = agent.spawnEffect;
-    // Matrix green overlay
     ctx.fillStyle = `rgba(100, 255, 100, ${agent.spawnEffect * 0.3})`;
     ctx.fillRect(drawX, drawY, dims.w, dims.h);
     ctx.globalAlpha = 1;
@@ -627,7 +751,7 @@ function drawFallbackCharacter(
     ctx.fillRect(cx + 0.5, cy - 7, 1.5, 0.8);
   }
 
-  // Idle bob
+  // Walk bob
   if (agent.state === 'idle') {
     const bob = Math.sin(gt * 2) * 0.5;
     ctx.fillStyle = agent.color + '40';
@@ -643,6 +767,7 @@ function drawNameTag(
   agent: AgentEntity,
   ax: number,
   ay: number,
+  gt: number,
 ): void {
   const name = agent.name;
   ctx.font = 'bold 6px monospace';
@@ -661,9 +786,9 @@ function drawNameTag(
   ctx.fillStyle = agent.color;
   ctx.fillText(name, nx, ny + 2);
 
-  // Activity indicator
+  // Activity indicator (pulsing dot)
   if (agent.state === 'type' || agent.state === 'read') {
-    const pulse = 1 + Math.sin(gameTimeRef.current * 5) * 0.2;
+    const pulse = 1 + Math.sin(gt * 5) * 0.2;
     ctx.fillStyle = agent.state === 'type' ? '#F59E0B' : '#8B5CF6';
     ctx.beginPath();
     ctx.arc(nx + nw / 2 + 1, ny, 2 * pulse, 0, Math.PI * 2);
@@ -671,7 +796,7 @@ function drawNameTag(
   }
 }
 
-// ─── Speech Bubble ───────────────────────────────────────────────────────────
+// ─── Speech Bubble (improved) ────────────────────────────────────────────────
 function drawSpeechBubble(
   ctx: CanvasRenderingContext2D,
   agent: AgentEntity,
@@ -707,27 +832,34 @@ function drawSpeechBubble(
   const bubbleW = maxLineW + 10;
   const bubbleH = lines.length * 8 + 8;
   const bubbleX = ax + TILE_SIZE / 2 - bubbleW / 2;
-  const bubbleY = ay - 38 - bubbleH;
+  const bubbleY = ay - 40 - bubbleH;
 
-  // Background
-  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  // Fade in effect
+  const fadeAlpha = Math.min(1, agent.speechTimer / 0.3);
+
+  // Background with agent color tint
+  ctx.globalAlpha = fadeAlpha;
+  ctx.fillStyle = 'rgba(10, 10, 30, 0.9)';
   ctx.beginPath();
   ctx.roundRect(bubbleX, bubbleY, bubbleW, bubbleH, 4);
   ctx.fill();
 
-  // Accent border
-  ctx.strokeStyle = agent.color + '50';
+  // Accent border (top line in agent's color)
+  ctx.strokeStyle = agent.color + '70';
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.roundRect(bubbleX, bubbleY, bubbleW, bubbleH, 4);
+  ctx.moveTo(bubbleX + 4, bubbleY);
+  ctx.lineTo(bubbleX + bubbleW - 4, bubbleY);
   ctx.stroke();
 
-  // Tail
-  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  // Tail pointing to agent head
+  const tailX = ax + TILE_SIZE / 2;
+  const tailY = bubbleY + bubbleH;
+  ctx.fillStyle = 'rgba(10, 10, 30, 0.9)';
   ctx.beginPath();
-  ctx.moveTo(ax + TILE_SIZE / 2 - 3, bubbleY + bubbleH);
-  ctx.lineTo(ax + TILE_SIZE / 2, bubbleY + bubbleH + 4);
-  ctx.lineTo(ax + TILE_SIZE / 2 + 3, bubbleY + bubbleH);
+  ctx.moveTo(tailX - 3, tailY);
+  ctx.lineTo(tailX, tailY + 5);
+  ctx.lineTo(tailX + 3, tailY);
   ctx.fill();
 
   // Text
@@ -737,14 +869,14 @@ function drawSpeechBubble(
     ctx.fillText(lines[i], bubbleX + 5, bubbleY + 8 + i * 8);
   }
 
-  // Cursor for active
-  if (agent.state === 'type' || agent.state === 'read') {
-    if (Math.sin(gt * 6) > 0) {
-      const lastW = ctx.measureText(lines[lines.length - 1]).width;
-      ctx.fillStyle = agent.color;
-      ctx.fillRect(bubbleX + 5 + lastW, bubbleY + 2 + (lines.length - 1) * 8, 3, 5);
-    }
+  // Typing cursor for active agents
+  if ((agent.state === 'type' || agent.state === 'read') && Math.sin(gt * 6) > 0) {
+    const lastW = ctx.measureText(lines[lines.length - 1]).width;
+    ctx.fillStyle = agent.color;
+    ctx.fillRect(bubbleX + 5 + lastW, bubbleY + 2 + (lines.length - 1) * 8, 3, 5);
   }
+
+  ctx.globalAlpha = 1;
 }
 
 // ─── Spawn Effect (matrix-style) ──────────────────────────────────────────────
@@ -757,7 +889,6 @@ function drawSpawnEffect(
   color: string,
 ): void {
   const p = 1 - progress;
-  // Expanding ring
   const alpha = Math.floor(progress * 200).toString(16).padStart(2, '0');
   ctx.strokeStyle = color + alpha;
   ctx.lineWidth = 1.5;
@@ -765,7 +896,6 @@ function drawSpawnEffect(
   ctx.arc(cx, cy, p * 25, 0, Math.PI * 2);
   ctx.stroke();
 
-  // Particles
   for (let i = 0; i < 5; i++) {
     const angle = (i / 5) * Math.PI * 2 + gt * 3;
     const dist = p * 18 + Math.sin(gt * 5 + i) * 3;
@@ -777,15 +907,14 @@ function drawSpawnEffect(
     ctx.fill();
   }
 
-  // Matrix green sweep
   ctx.fillStyle = `rgba(100, 255, 100, ${progress * 0.2})`;
   ctx.beginPath();
   ctx.arc(cx, cy, 12 * progress, 0, Math.PI * 2);
   ctx.fill();
 }
 
-// ─── Minimap ──────────────────────────────────────────────────────────────────
-function renderMinimap(
+// ─── Minimap (built once, cached) ─────────────────────────────────────────────
+function buildMinimap(
   gs: GameState,
   agents: AgentEntity[],
   cam: Camera,
@@ -809,6 +938,13 @@ function renderMinimap(
   ctx.beginPath();
   ctx.roundRect(0, 0, canvas.width, canvas.height, 4);
   ctx.fill();
+
+  // Day/night phase label
+  const dn = getDayNightOverlay(0);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = 'bold 8px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(dn.phase, ox, oy - 5);
 
   // Tiles (batched)
   const batches = new Map<string, { x: number; y: number }[]>();
