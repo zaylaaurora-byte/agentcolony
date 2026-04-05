@@ -183,6 +183,87 @@
   animation: float 3s ease-in-out infinite;
 }
 
+/* Character Animations */
+@keyframes bounce-subtle {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes talk {
+  0%, 100% {
+    transform: scaleY(1);
+  }
+  50% {
+    transform: scaleY(1.03);
+  }
+}
+
+@keyframes work-glow {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+@keyframes summon-appear {
+  0% {
+    transform: scale(0) rotate(180deg);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.2) rotate(-10deg);
+    opacity: 1;
+  }
+  80% {
+    transform: scale(0.95) rotate(5deg);
+  }
+  100% {
+    transform: scale(1) rotate(0deg);
+    opacity: 1;
+  }
+}
+
+@keyframes walk-cycle {
+  0%, 100% {
+    transform: translateY(0) translateX(0);
+  }
+  25% {
+    transform: translateY(-1px) translateX(1px);
+  }
+  50% {
+    transform: translateY(0) translateX(0);
+  }
+  75% {
+    transform: translateY(-1px) translateX(-1px);
+  }
+}
+
+.animate-bounce-subtle {
+  animation: bounce-subtle 0.4s ease-in-out infinite;
+}
+
+.animate-talk {
+  animation: talk 0.3s ease-in-out infinite;
+}
+
+.animate-work-glow {
+  animation: work-glow 1.5s ease-in-out infinite;
+}
+
+.animate-summon {
+  animation: summon-appear 0.8s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+.animate-walk-cycle {
+  animation: walk-cycle 0.6s ease-in-out infinite;
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

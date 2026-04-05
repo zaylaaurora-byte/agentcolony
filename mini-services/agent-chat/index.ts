@@ -125,7 +125,7 @@ const DEFAULT_AGENTS: Record<string, { name: string; role: string; systemPrompt:
     role: "planner",
     station: "planning-desk",
     systemPrompt:
-      "You are the Mastermind — a brilliant strategist and planner. You receive goals and break them into tasks. You review results critically. Use [TASK: description] to assign work. Use [COMPLETE] when satisfied. Keep responses concise.",
+      "You are the Mastermind — a brilliant strategist and planner. You receive goals and break them into tasks. You review results critically. Use [TASK: description] to assign work. Use [COMPLETE] when satisfied. You can SUMMON new agents mid-session: use [SUMMON: worker], [SUMMON: reviewer], or [SUMMON: creative] to bring in help. Keep responses concise.",
   },
   worker: {
     name: "Worker",
@@ -302,9 +302,9 @@ async function runAgentLoop(
   const session = sessions.get(sessionId)!;
   const loopConfig = config.loop;
 
-  const hasWorker = agents.includes("worker");
-  const hasReviewer = agents.includes("reviewer");
-  const hasCreative = agents.includes("creative");
+  let hasWorker = agents.includes("worker");
+  let hasReviewer = agents.includes("reviewer");
+  let hasCreative = agents.includes("creative");
 
   // Create conversations with auto-context
   for (const agentId of agents) {
@@ -367,6 +367,42 @@ ${!hasWorker ? "NOTE: No Worker available — you must handle execution yourself
 
       // Extract task from mastermind
       const taskMatch = masterResponse.match(/\[TASK:\s*([\s\S]*?)\]/);
+      
+      // Check for SUMMON commands
+      const summonMatches = [...masterResponse.matchAll(/\[SUMMON:\s*(\w+)\]/gi)];
+      for (const summonMatch of summonMatches) {
+        const agentToSummon = summonMatch[1].toLowerCase();
+        if (DEFAULT_AGENTS[agentToSummon] && !session.agents.includes(agentToSummon)) {
+          session.agents.push(agentToSummon);
+          const config = loadConfig();
+          session.conversations.set(agentToSummon, {
+            messages: [{ role: "system", content: buildSystemPrompt(agentToSummon, config) }],
+          });
+          const idlePositions = [
+            { x: 25, y: 70 }, { x: 40, y: 72 }, { x: 60, y: 72 }, { x: 75, y: 70 },
+          ];
+          const posIdx = session.agents.length - 1;
+          session.agentPositions[agentToSummon] = {
+            x: idlePositions[posIdx]?.x || 50,
+            y: idlePositions[posIdx]?.y || 70,
+            targetX: idlePositions[posIdx]?.x || 50,
+            targetY: idlePositions[posIdx]?.y || 70,
+            station: "idle",
+            socketRef: socket,
+          };
+          socket.emit("agent-summoned", {
+            agentId: agentToSummon,
+            name: DEFAULT_AGENTS[agentToSummon].name,
+            position: session.agentPositions[agentToSummon],
+          });
+          console.log(`Mastermind summoned: ${agentToSummon}`);
+          // Update has flags
+          if (agentToSummon === "worker") hasWorker = true;
+          if (agentToSummon === "reviewer") hasReviewer = true;
+          if (agentToSummon === "creative") hasCreative = true;
+        }
+      }
+
       if (!taskMatch) {
         // No task found — ask if done
         const followUp = await agentChat(
