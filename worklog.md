@@ -3,71 +3,70 @@
 ---
 Task ID: 1
 Agent: Main
-Task: Initialize Next.js project and generate cute character avatars
+Task: Generate 2D pixel art character sprites
 
 Work Log:
-- Initialized fullstack dev environment
-- Generated 4 AI character avatar images:
-  - Mastermind (purple brain wizard) - /public/avatars/mastermind.png
-  - Worker (orange construction robot) - /public/avatars/worker.png
-  - Reviewer (green scientist) - /public/avatars/reviewer.png
-  - Creative (pink artist) - /public/avatars/creative.png
+- Generated 4 pixel-art top-down RPG character sprites
+- mastermind.png (purple wizard), worker.png (orange robot), reviewer.png (green scientist), creative.png (pink artist)
+- Saved to /public/sprites/
 
 Stage Summary:
-- Project initialized at /home/z/my-project
-- All avatar images generated successfully
+- All 4 character sprites ready
 
 ---
 Task ID: 2
 Agent: Main
-Task: Build Socket.IO mini-service with ZAI agent conversation loop
+Task: Create agent-config.json for persistent context, tokens, and loop settings
 
 Work Log:
-- Created mini-services/agent-chat/package.json with socket.io + z-ai-web-dev-sdk
-- Built mini-services/agent-chat/index.ts with full agent loop engine:
-  - 4 agents: mastermind, worker, reviewer, creative
-  - Each has unique system prompt and conversation history
-  - Mastermind plans, delegates [TASK:] to Worker, reviews output
-  - Worker executes tasks, returns results
-  - Reviewer provides quality feedback
-  - Creative adds creative suggestions
-  - Loop continues until [COMPLETE] or max 20 rounds
-  - Streaming simulation via word chunking
-  - Pause/resume/stop support
-  - User intervention support
-- Installed deps, service running on port 3004
+- Created /agent-config.json at project root
+- Sections: context (auto-fed to all agents), agents (personalities), loop (iterations, quality threshold), tokens (API keys)
+- Backend reads this file on startup and reloads on request
 
 Stage Summary:
-- Agent chat engine complete at mini-services/agent-chat/index.ts
-- Socket.IO server on port 3004, connected via Caddy proxy
+- Config file at /home/z/my-project/agent-config.json
+- Agents auto-know user context, project info, preferences, available tokens
 
 ---
 Task ID: 3
 Agent: Main
-Task: Build frontend chat UI with character environments
+Task: Rebuild backend engine with loop mode and auto-context
 
 Work Log:
-- Created src/lib/agent-config.ts - Agent configuration (names, colors, avatars, roles)
-- Created src/lib/chat-store.ts - Zustand store for chat state management
-- Created src/components/chat/AgentAvatar.tsx - Animated avatar with glow effect
-- Created src/components/chat/MessageBubble.tsx - Chat message with avatar, streaming cursor
-- Created src/components/chat/ChatInput.tsx - Auto-resizing input with Enter key support
-- Created src/components/chat/AgentSelector.tsx - Toggle agents with check animation
-- Created src/components/chat/TaskBoard.tsx - Task list with status icons (pending/progress/done/failed)
-- Created src/components/chat/SessionControls.tsx - Start/Pause/Resume/Stop buttons
-- Built src/app/page.tsx - Main page with 3-column layout:
-  - Left sidebar: Agent selector + details
-  - Center: Real-time chat with streaming messages
-  - Right: Task board
-  - Header with agent avatars strip, status badges, connection indicator
-  - Empty state with example goals
-  - Mobile responsive (sidebars hidden on small screens)
-- Updated src/app/layout.tsx with AgentChat metadata
-- Updated src/app/globals.css with custom animations (pulse-glow, bounce-in, float, thinking-dots)
-- Installed socket.io-client in main project
+- Rewrote mini-services/agent-chat/index.ts
+- Added loadConfig() to read agent-config.json
+- buildSystemPrompt() injects user context, tokens, and personality into every agent
+- Loop mode: agents iterate until quality threshold (8/10) or max iterations (20)
+- parseQualityScore() extracts ratings from Reviewer
+- Character position tracking for 2D world view
+- moveAgent() sends position updates to frontend
 
 Stage Summary:
-- Full frontend complete with dark theme, colorful agent accents
-- Real-time streaming via Socket.IO
-- Task board tracks progress
-- Mobile responsive design
+- Full loop engine with quality-gated iteration
+- Auto-context from config file
+- Character position system for 2D view
+
+---
+Task ID: 4-6
+Agent: Main
+Task: Build complete 2D RimWorld-style UI
+
+Work Log:
+- Rewrote src/app/page.tsx as 2D simulation view
+- Dark space-themed environment with grid floor
+- 4 stations: Planning Desk, Workbench, Review Desk, Creative Studio
+- 2D characters with animated movement between stations
+- Speech bubbles above characters showing real-time thoughts
+- Floating task board (top-right) with quality scores
+- Floating team selector (top-left) for agent picking
+- Chat log panel (toggle with icon)
+- Config reference panel (toggle with icon)
+- User intervention via input bar during sessions
+- Session controls: Start, Pause, Resume, Stop
+- Iteration + quality tracking in header
+
+Stage Summary:
+- Complete RimWorld-style 2D simulation UI
+- Characters move to stations, show speech bubbles, iterate on tasks
+- Quality-gated loop mode
+- Config file auto-feeds context to all agents

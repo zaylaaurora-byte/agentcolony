@@ -1,17 +1,82 @@
 import { createServer } from "http";
 import { Server } from "socket.io";
 import ZAI from "z-ai-web-dev-sdk";
+import { readFileSync, existsSync } from "fs";
+import { join } from "path";
 
 const httpServer = createServer();
 const io = new Server(httpServer, {
   path: "/",
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
   pingTimeout: 120000,
   pingInterval: 25000,
 });
+
+// ─── Load Config ────────────────────────────────────────────────────────────
+
+interface AgentConfigFile {
+  context: {
+    about_user?: string;
+    project_info?: string;
+    preferences?: string;
+  };
+  agents: Record<
+    string,
+    {
+      enabled: boolean;
+      personality: string;
+      extra_context?: string;
+    }
+  >;
+  loop: {
+    max_iterations: number;
+    auto_improve: boolean;
+    quality_threshold: number;
+    improvement_prompt: string;
+  };
+  tokens: Record<string, string>;
+}
+
+let configFile: AgentConfigFile | null = null;
+
+function loadConfig(): AgentConfigFile {
+  const configPath = join(process.cwd(), "agent-config.json");
+  const altPath = join(process.cwd(), "..", "agent-config.json");
+  const projectRoot = "/home/z/my-project/agent-config.json";
+
+  const path = existsSync(configPath) ? configPath : existsSync(altPath) ? altPath : existsSync(projectRoot) ? projectRoot : null;
+
+  if (path) {
+    try {
+      const raw = readFileSync(path, "utf-8");
+      configFile = JSON.parse(raw);
+      console.log(`✅ Loaded config from ${path}`);
+    } catch (e: any) {
+      console.error(`⚠️ Failed to parse config: ${e.message}`);
+    }
+  } else {
+    console.log("⚠️ No agent-config.json found, using defaults");
+  }
+
+  return (
+    configFile ?? {
+      context: {},
+      agents: {},
+      loop: {
+        max_iterations: 20,
+        auto_improve: true,
+        quality_threshold: 8,
+        improvement_prompt:
+          "Review the previous output and make it BETTER. Improve quality, fix issues, add polish.",
+      },
+      tokens: {},
+    }
+  );
+}
+
+function reloadConfig() {
+  configFile = loadConfig();
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -21,12 +86,15 @@ interface AgentMessage {
   role: string;
   content: string;
   timestamp: string;
+  iteration?: number;
 }
 
 interface Task {
   taskId: string;
   status: "pending" | "in_progress" | "done" | "failed";
   description: string;
+  iteration?: number;
+  qualityScore?: number;
 }
 
 interface AgentConversation {
@@ -34,54 +102,57 @@ interface AgentConversation {
 }
 
 interface Session {
+  sessionId: string;
   goal: string;
   agents: string[];
-  status: "running" | "paused" | "complete" | "error";
+  status: "idle" | "running" | "paused" | "complete" | "error";
   paused: boolean;
   stopped: boolean;
   conversations: Map<string, AgentConversation>;
   tasks: Task[];
-  taskCounter: number;
-  round: number;
+  currentIteration: number;
+  qualityScore: number;
+  bestOutput: string;
   userMessages: string[];
+  agentPositions: Record<string, { x: number; y: number; targetX: number; targetY: number; station: string }>;
 }
 
-// ─── Agent Configuration ─────────────────────────────────────────────────────
+// ─── Agent Definitions ──────────────────────────────────────────────────────
 
-const AGENT_CONFIG: Record<
-  string,
-  { name: string; role: string; systemPrompt: string }
-> = {
+const DEFAULT_AGENTS: Record<string, { name: string; role: string; systemPrompt: string; station: string }> = {
   mastermind: {
     name: "Mastermind",
     role: "planner",
+    station: "planning-desk",
     systemPrompt:
-      "You are the Mastermind — a brilliant strategist and planner. You receive goals from the user and break them into specific tasks for the Worker. You review the Worker's output and provide feedback. You decide when a task is complete or needs revision. Always respond with your thinking, then specify the next task for the Worker in format: [TASK: description of task]. When all tasks are done, respond with [COMPLETE]. Keep your responses concise but thorough.",
+      "You are the Mastermind — a brilliant strategist and planner. You receive goals and break them into tasks. You review results critically. Use [TASK: description] to assign work. Use [COMPLETE] when satisfied. Keep responses concise.",
   },
   worker: {
     name: "Worker",
     role: "executor",
+    station: "workbench",
     systemPrompt:
-      "You are the Worker — a diligent and skilled executor. You receive tasks from the Mastermind and complete them to the best of your ability. Provide detailed, high-quality output for each task. Be creative and thorough. When you complete a task, clearly state what you've produced.",
+      "You are the Worker — a diligent executor who delivers thorough results. Complete tasks thoroughly. Summarize what you produced.",
   },
   reviewer: {
     name: "Reviewer",
     role: "reviewer",
+    station: "review-desk",
     systemPrompt:
-      "You are the Reviewer — a meticulous quality checker. You review the Worker's output and provide constructive feedback. Point out issues, suggest improvements, and verify completeness. Format your review clearly.",
+      "You are the Reviewer — a quality inspector. Rate quality 1-10. List specific issues and improvements. Be constructive.",
   },
   creative: {
     name: "Creative",
     role: "creative",
+    station: "creative-studio",
     systemPrompt:
-      "You are the Creative — an imaginative designer and thinker. You add creative flair, suggest improvements, and think outside the box. Help make the output more engaging and polished.",
+      "You are the Creative — an innovator who adds flair. Suggest improvements in UX, design, or approach. Be enthusiastic but practical.",
   },
 };
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const sessions = new Map<string, Session>();
-const MAX_ROUNDS = 20;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -89,31 +160,58 @@ function generateId(): string {
   return Math.random().toString(36).substring(2, 11);
 }
 
-function createAgent(agentId: string): AgentConversation {
-  const config = AGENT_CONFIG[agentId];
-  if (!config) throw new Error(`Unknown agent: ${agentId}`);
-  return {
-    messages: [{ role: "system", content: config.systemPrompt }],
-  };
+function buildSystemPrompt(agentId: string, cfg: AgentConfigFile): string {
+  const defaults = DEFAULT_AGENTS[agentId];
+  const custom = cfg.agents[agentId];
+
+  let prompt = custom?.personality || defaults?.systemPrompt || `You are ${agentId}.`;
+
+  // Add extra context from config
+  if (custom?.extra_context) {
+    prompt += `\n\n${custom.extra_context}`;
+  }
+
+  // Add user context (auto-fed)
+  const ctx = cfg.context;
+  if (ctx) {
+    const parts: string[] = [];
+    if (ctx.about_user) parts.push(`About the user: ${ctx.about_user}`);
+    if (ctx.project_info) parts.push(`Project info: ${ctx.project_info}`);
+    if (ctx.preferences) parts.push(`User preferences: ${ctx.preferences}`);
+    if (parts.length > 0) {
+      prompt += `\n\n--- USER CONTEXT (auto-loaded, do not ask about this) ---\n${parts.join("\n")}\n--- END CONTEXT ---`;
+    }
+  }
+
+  // Add tokens info (available resources)
+  if (cfg.tokens && Object.keys(cfg.tokens).length > 0) {
+    const tokenNames = Object.keys(cfg.tokens).map((k) => k.replace(/_.*$/, ""));
+    prompt += `\n\nAvailable API resources: ${tokenNames.join(", ")}. The user has pre-configured these access tokens — they are available for use.`;
+  }
+
+  return prompt;
 }
 
 async function agentChat(
   session: Session,
   agentId: string,
   userMessage: string,
-  socket: any
+  socket: any,
+  iteration?: number
 ): Promise<string> {
-  const config = AGENT_CONFIG[agentId];
+  const config = loadConfig();
+  const defaults = DEFAULT_AGENTS[agentId];
   const conversation = session.conversations.get(agentId);
-
   if (!conversation) throw new Error(`No conversation for agent: ${agentId}`);
 
   // Add user message to history
   conversation.messages.push({ role: "user", content: userMessage });
 
   try {
-    const zai = await ZAI.create();
+    // Move character to active station
+    moveAgent(session, agentId, defaults?.station || "center");
 
+    const zai = await ZAI.create();
     const completion = await zai.chat.completions.create({
       messages: [...conversation.messages],
       temperature: 0.7,
@@ -121,67 +219,78 @@ async function agentChat(
     });
 
     const assistantContent = completion.choices[0]?.message?.content || "";
+    conversation.messages.push({ role: "assistant", content: assistantContent });
 
-    // Add assistant response to history
-    conversation.messages.push({
-      role: "assistant",
-      content: assistantContent,
-    });
-
-    // Stream the full response as chunks (simulate streaming since SDK doesn't stream)
+    // Emit streaming chunks
     const words = assistantContent.split(" ");
-    const chunkSize = Math.max(1, Math.floor(words.length / 15));
-
+    const chunkSize = Math.max(1, Math.floor(words.length / 20));
     for (let i = 0; i < words.length; i += chunkSize) {
       const chunk = words.slice(i, i + chunkSize).join(" ") + " ";
-      socket.emit("agent-stream", {
-        agentId,
-        chunk,
-      });
-      await new Promise((r) => setTimeout(r, 30));
+      socket.emit("agent-stream", { agentId, chunk });
+      await new Promise((r) => setTimeout(r, 25));
     }
 
-    // Emit the complete message
+    // Emit complete message
     const message: AgentMessage = {
       agentId,
-      agentName: config.name,
-      role: config.role,
+      agentName: defaults?.name || agentId,
+      role: defaults?.role || agentId,
       content: assistantContent,
       timestamp: new Date().toISOString(),
+      iteration,
     };
-
     socket.emit("agent-message", message);
 
     return assistantContent;
   } catch (error: any) {
     console.error(`Error in agentChat for ${agentId}:`, error.message);
-    const errorMsg = `Error: ${error.message}`;
-    socket.emit("session-error", { message: errorMsg });
+    socket.emit("session-error", { message: `Agent ${agentId} error: ${error.message}` });
     throw error;
   }
 }
 
-function addTask(session: Session, description: string): Task {
-  const task: Task = {
-    taskId: generateId(),
-    status: "pending",
-    description,
-  };
-  session.tasks.push(task);
-  return task;
-}
-
-function updateTask(
-  session: Session,
-  taskIndex: number,
-  status: Task["status"]
-) {
-  if (session.tasks[taskIndex]) {
-    session.tasks[taskIndex].status = status;
+function moveAgent(session: Session, agentId: string, station: string) {
+  const pos = session.agentPositions[agentId];
+  if (pos) {
+    pos.station = station;
+    // Target positions for different stations
+    const stationPositions: Record<string, { x: number; y: number }> = {
+      "planning-desk": { x: 20, y: 25 },
+      workbench: { x: 50, y: 60 },
+      "review-desk": { x: 80, y: 25 },
+      "creative-studio": { x: 50, y: 30 },
+      center: { x: 50, y: 45 },
+      idle: { x: 15, y: 70 },
+    };
+    const target = stationPositions[station] || stationPositions.center;
+    pos.targetX = target.x;
+    pos.targetY = target.y;
+    // We'll emit positions to the client
+    if (pos.socketRef) {
+      pos.socketRef.emit("agent-move", {
+        agentId,
+        x: pos.targetX,
+        y: pos.targetY,
+        station,
+      });
+    }
   }
 }
 
-// ─── Main Conversation Loop ─────────────────────────────────────────────────
+function parseQualityScore(text: string): number {
+  // Try to find a quality rating like "8/10" or "quality: 7" etc.
+  const patterns = [/(\d+)\s*\/\s*10/i, /quality[:\s]*(\d+)/i, /rating[:\s]*(\d+)/i, /score[:\s]*(\d+)/i];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const score = parseInt(match[1]);
+      if (score >= 1 && score <= 10) return score;
+    }
+  }
+  return 0; // No score found
+}
+
+// ─── Main Loop (RimWorld-style) ─────────────────────────────────────────────
 
 async function runAgentLoop(
   sessionId: string,
@@ -189,163 +298,213 @@ async function runAgentLoop(
   agents: string[],
   socket: any
 ) {
+  const config = loadConfig();
   const session = sessions.get(sessionId)!;
+  const loopConfig = config.loop;
 
   const hasWorker = agents.includes("worker");
   const hasReviewer = agents.includes("reviewer");
   const hasCreative = agents.includes("creative");
 
-  // Create conversations for each agent
-  const mastermindConv = createAgent("mastermind");
-  session.conversations.set("mastermind", mastermindConv);
-
-  if (hasWorker) session.conversations.set("worker", createAgent("worker"));
-  if (hasReviewer)
-    session.conversations.set("reviewer", createAgent("reviewer"));
-  if (hasCreative)
-    session.conversations.set("creative", createAgent("creative"));
+  // Create conversations with auto-context
+  for (const agentId of agents) {
+    const systemPrompt = buildSystemPrompt(agentId, config);
+    session.conversations.set(agentId, {
+      messages: [{ role: "system", content: systemPrompt }],
+    });
+  }
 
   try {
-    // ── Phase 1: Mastermind plans ──
     session.status = "running";
-    socket.emit("session-status", { status: "running" });
+    socket.emit("session-status", {
+      status: "running",
+      maxIterations: loopConfig.max_iterations,
+      qualityThreshold: loopConfig.quality_threshold,
+    });
 
     let userContext = "";
     if (session.userMessages.length > 0) {
       userContext =
-        "\n\nThe user also provided this additional context/intervention: " +
-        session.userMessages.join("; ");
+        "\n\nThe user provided this additional guidance: " + session.userMessages.join("; ");
     }
 
+    // ── Phase 1: Mastermind plans ──
     const planPrompt = `User goal: ${goal}${userContext}
 
-Break this goal into concrete tasks. Outline your strategy, then assign the first task to the Worker using format: [TASK: description of task].
+Break this into a clear task plan. Be specific about what needs to be done. Assign the first task using [TASK: description].
 
-Available team members: ${agents
-      .map((a) => AGENT_CONFIG[a].name)
-      .join(", ")}
+Team: ${agents.map((a) => DEFAULT_AGENTS[a]?.name || a).join(", ")}
+${!hasWorker ? "NOTE: No Worker available — you must handle execution yourself." : ""}`;
 
-${!hasWorker ? "NOTE: No Worker is available. You will need to handle all execution yourself." : ""}`;
+    let masterResponse = await agentChat(session, "mastermind", planPrompt, socket, 0);
 
-    const masterPlan = await agentChat(
-      session,
-      "mastermind",
-      planPrompt,
-      socket
-    );
-
-    // Check if already complete
-    if (masterPlan.includes("[COMPLETE]")) {
+    if (masterResponse.includes("[COMPLETE]")) {
       session.status = "complete";
+      session.bestOutput = masterResponse;
       socket.emit("session-status", { status: "complete" });
+      socket.emit("final-output", { content: session.bestOutput });
       return;
     }
 
-    // ── Phase 2: Execution loop ──
-    while (session.round < MAX_ROUNDS && !session.paused && !session.stopped) {
-      session.round++;
+    // ── Phase 2: Iterative Loop ──
+    let iteration = 0;
+    let currentTask = "";
+    let workerOutput = "";
+
+    while (
+      iteration < loopConfig.max_iterations &&
+      !session.paused &&
+      !session.stopped
+    ) {
+      iteration++;
+      session.currentIteration = iteration;
+
+      socket.emit("iteration-update", {
+        iteration,
+        maxIterations: loopConfig.max_iterations,
+        qualityScore: session.qualityScore,
+      });
 
       // Extract task from mastermind
-      const taskMatch = masterPlan.match(/\[TASK:\s*([\s\S]*?)\]/);
+      const taskMatch = masterResponse.match(/\[TASK:\s*([\s\S]*?)\]/);
       if (!taskMatch) {
-        // No more tasks — ask mastermind if we're done
+        // No task found — ask if done
         const followUp = await agentChat(
           session,
           "mastermind",
-          "You didn't specify a [TASK:] in your last message. Are all tasks complete? If so, respond with [COMPLETE]. Otherwise, assign the next task.",
-          socket
+          "No [TASK:] found in your response. If all tasks are done, respond [COMPLETE]. Otherwise assign the next task.",
+          socket,
+          iteration
         );
-
         if (followUp.includes("[COMPLETE]")) break;
+        masterResponse = followUp;
         continue;
       }
 
-      const taskDescription = taskMatch[1].trim();
-      const taskIndex = session.tasks.length;
-      const task = addTask(session, taskDescription);
+      currentTask = taskMatch[1].trim();
+
+      // Add task to board
+      const task: Task = {
+        taskId: generateId(),
+        status: "in_progress",
+        description: currentTask,
+        iteration,
+      };
+      session.tasks.push(task);
       socket.emit("task-update", task);
 
-      // ── Worker execution ──
+      // ── Worker executes ──
       if (hasWorker) {
-        updateTask(session, taskIndex, "in_progress");
-        socket.emit("task-update", session.tasks[taskIndex]);
+        const improveContext =
+          loopConfig.auto_improve && iteration > 1
+            ? `\n\nThis is iteration ${iteration}. Previous output:\n${workerOutput}\n\n${loopConfig.improvement_prompt.replace("{iteration}", String(iteration))}`
+            : "";
 
-        const workerResult = await agentChat(
+        workerOutput = await agentChat(
           session,
           "worker",
-          `Mastermind assigned you this task: ${taskDescription}
-
-Complete this task thoroughly and provide detailed output.`,
-          socket
+          `Task: ${currentTask}${improveContext}\n\nComplete this thoroughly.`,
+          socket,
+          iteration
         );
 
-        updateTask(session, taskIndex, "done");
-        socket.emit("task-update", session.tasks[taskIndex]);
+        task.status = "done";
+        socket.emit("task-update", task);
 
-        // ── Reviewer review ──
+        // ── Reviewer rates quality ──
         if (hasReviewer) {
-          await agentChat(
-            session,
-            "reviewer",
-            `The Worker completed this task: "${taskDescription}"\n\nHere is the Worker's output:\n\n${workerResult}\n\nReview this output. Point out issues, suggest improvements, and verify completeness.`,
-            socket
-          );
+          const reviewPrompt = `Task: "${currentTask}"\n\nWorker output:\n${workerOutput}\n\nRate quality 1-10. List issues and improvements.`;
+          const review = await agentChat(session, "reviewer", reviewPrompt, socket, iteration);
+
+          const score = parseQualityScore(review);
+          task.qualityScore = score || 5; // Default if no score parsed
+          session.qualityScore = score;
+          socket.emit("task-update", task);
+
+          // Check if quality threshold reached
+          if (loopConfig.auto_improve && score >= loopConfig.quality_threshold && score > 0) {
+            // Quality is good enough!
+            const qualityMsg = `Quality score ${score}/${loopConfig.quality_threshold} reached! Stopping improvement loop.`;
+            socket.emit("quality-reached", { score, threshold: loopConfig.quality_threshold });
+
+            // Let mastermind wrap up
+            const wrapUp = await agentChat(
+              session,
+              "mastermind",
+              `Quality score ${score}/10 reached for task "${currentTask}". The Reviewer is satisfied. Summarize the final result and respond [COMPLETE].`,
+              socket,
+              iteration
+            );
+            if (wrapUp.includes("[COMPLETE]")) break;
+          }
         }
 
-        // ── Creative input ──
+        // ── Creative adds flair ──
         if (hasCreative) {
           await agentChat(
             session,
             "creative",
-            `The Worker completed this task: "${taskDescription}"\n\nHere is the Worker's output:\n\n${workerResult}\n\nAdd your creative perspective. Suggest improvements, creative enhancements, or polish to make this better.`,
-            socket
+            `Task: "${currentTask}"\n\nCurrent output:\n${workerOutput}\n\nAdd your creative input. Suggest improvements.`,
+            socket,
+            iteration
           );
         }
 
-        // ── Mastermind reviews and delegates next ──
-        let reviewContext = `Worker completed task "${taskDescription}". Here's their output:\n\n${workerResult}`;
-        if (hasReviewer) reviewContext += "\n\nThe Reviewer has also provided their feedback.";
-        if (hasCreative) reviewContext += "\n\nThe Creative has also provided their input.";
+        // ── Mastermind reviews and decides next step ──
+        let reviewContext = `Worker completed: "${currentTask}"\n\nOutput:\n${workerOutput}`;
+        if (hasReviewer) reviewContext += `\n\nReviewer scored this ${session.qualityScore || "?"}/10.`;
+        if (hasCreative) reviewContext += `\n\nCreative has also given input.`;
 
-        const masterReview = await agentChat(
+        masterResponse = await agentChat(
           session,
           "mastermind",
-          `${reviewContext}\n\nReview the results. If more work is needed, assign the next task with [TASK: description]. If all tasks for the goal are complete, respond with [COMPLETE].`,
-          socket
+          `${reviewContext}\n\nIteration ${iteration}/${loopConfig.max_iterations}. ${
+            loopConfig.auto_improve && session.qualityScore < loopConfig.quality_threshold
+              ? `Quality is below ${loopConfig.quality_threshold}/10. Assign improvement task or refine approach.`
+              : "Assign next task or [COMPLETE] if done."
+          }`,
+          socket,
+          iteration
         );
 
-        if (masterReview.includes("[COMPLETE]")) break;
+        if (masterResponse.includes("[COMPLETE]")) break;
+
+        // Move agents back to idle before next round
+        for (const id of agents) {
+          if (id !== "mastermind") moveAgent(session, id, "idle");
+        }
       } else {
-        // No worker — mastermind does everything
-        updateTask(session, taskIndex, "done");
-        socket.emit("task-update", session.tasks[taskIndex]);
+        // No worker — mastermind handles everything
+        task.status = "done";
+        socket.emit("task-update", task);
 
         const followUp = await agentChat(
           session,
           "mastermind",
-          `Task completed. Are there more tasks remaining? If so, assign the next one with [TASK: description]. If all done, respond with [COMPLETE].`,
-          socket
+          `Task done. Iteration ${iteration}/${loopConfig.max_iterations}. More tasks? [TASK: ...] or [COMPLETE].`,
+          socket,
+          iteration
         );
-
         if (followUp.includes("[COMPLETE]")) break;
+        masterResponse = followUp;
       }
 
-      // Wait a beat between rounds
-      await new Promise((r) => setTimeout(r, 500));
+      // Brief pause between iterations
+      await new Promise((r) => setTimeout(r, 800));
     }
 
     // ── Completion ──
     if (!session.stopped) {
       session.status = "complete";
+      session.bestOutput = workerOutput || "Session complete.";
       socket.emit("session-status", { status: "complete" });
+      socket.emit("final-output", { content: session.bestOutput });
     }
   } catch (error: any) {
     console.error("Agent loop error:", error.message);
     session.status = "error";
     socket.emit("session-status", { status: "error" });
-    socket.emit("session-error", {
-      message: `Session error: ${error.message}`,
-    });
+    socket.emit("session-error", { message: error.message });
   }
 }
 
@@ -358,53 +517,87 @@ io.on("connection", (socket) => {
     const { goal, agents } = data;
     const sessionId = generateId();
 
-    console.log(`Starting session ${sessionId} with goal: ${goal}, agents: ${agents.join(", ")}`);
+    console.log(`Starting session ${sessionId}: "${goal}" with [${agents.join(", ")}]`);
+
+    // Initial agent positions (RimWorld-style)
+    const agentPositions: Session["agentPositions"] = {};
+    const positions = [
+      { x: 15, y: 70 },
+      { x: 30, y: 70 },
+      { x: 70, y: 70 },
+      { x: 85, y: 70 },
+    ];
+    agents.forEach((id, i) => {
+      agentPositions[id] = {
+        x: positions[i]?.x || 50,
+        y: positions[i]?.y || 70,
+        targetX: positions[i]?.x || 50,
+        targetY: positions[i]?.y || 70,
+        station: "idle",
+        socketRef: socket,
+      };
+    });
 
     const session: Session = {
+      sessionId,
       goal,
       agents,
-      status: "running",
+      status: "idle",
       paused: false,
       stopped: false,
       conversations: new Map(),
       tasks: [],
-      taskCounter: 0,
-      round: 0,
+      currentIteration: 0,
+      qualityScore: 0,
+      bestOutput: "",
       userMessages: [],
+      agentPositions,
     };
 
     sessions.set(sessionId, session);
 
-    // Emit session started
-    socket.emit("session-status", { status: "running" });
+    socket.emit("session-init", {
+      sessionId,
+      agents,
+      agentPositions,
+      config: {
+        maxIterations: loadConfig().loop.max_iterations,
+        qualityThreshold: loadConfig().loop.quality_threshold,
+      },
+    });
 
-    // Run the loop asynchronously
     runAgentLoop(sessionId, goal, agents, socket).catch((err) => {
       console.error("Unhandled loop error:", err);
     });
   });
 
-  socket.on(
-    "user-message",
-    (data: { message: string }) => {
-      const { message } = data;
-      // Find the active session for this socket
-      for (const [, session] of sessions) {
-        if (session.status === "running" || session.status === "paused") {
-          session.userMessages.push(message);
-          console.log(`User intervention: ${message}`);
-        }
+  socket.on("user-message", (data: { message: string }) => {
+    for (const [, session] of sessions) {
+      if (session.status === "running" || session.status === "paused") {
+        session.userMessages.push(data.message);
+        console.log(`User intervention: ${data.message}`);
+
+        // Show user message in the world
+        const msg: AgentMessage = {
+          agentId: "user",
+          agentName: "You",
+          role: "user",
+          content: data.message,
+          timestamp: new Date().toISOString(),
+        };
+        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
+        if (sock) sock.emit("agent-message", msg);
       }
     }
-  );
+  });
 
   socket.on("pause-session", () => {
     for (const [, session] of sessions) {
       if (session.status === "running") {
         session.paused = true;
         session.status = "paused";
-        socket.emit("session-status", { status: "paused" });
-        console.log("Session paused");
+        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
+        if (sock) sock.emit("session-status", { status: "paused" });
       }
     }
   });
@@ -414,33 +607,31 @@ io.on("connection", (socket) => {
       if (session.status === "paused") {
         session.paused = false;
         session.status = "running";
-        socket.emit("session-status", { status: "running" });
-        console.log("Session resumed");
+        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
+        if (sock) sock.emit("session-status", { status: "running" });
       }
     }
   });
 
   socket.on("stop-session", () => {
     for (const [, session] of sessions) {
-      if (
-        session.status === "running" ||
-        session.status === "paused"
-      ) {
+      if (session.status === "running" || session.status === "paused") {
         session.stopped = true;
         session.paused = false;
         session.status = "complete";
-        socket.emit("session-status", { status: "complete" });
-        console.log("Session stopped by user");
+        const sock = session.agentPositions[Object.keys(session.agentPositions)[0]]?.socketRef;
+        if (sock) sock.emit("session-status", { status: "complete" });
       }
     }
   });
 
-  socket.on("disconnect", () => {
-    console.log(`Client disconnected: ${socket.id}`);
+  socket.on("reload-config", () => {
+    reloadConfig();
+    socket.emit("config-reloaded", { success: true });
   });
 
-  socket.on("error", (error) => {
-    console.error(`Socket error (${socket.id}):`, error);
+  socket.on("disconnect", () => {
+    console.log(`Client disconnected: ${socket.id}`);
   });
 });
 
@@ -448,15 +639,13 @@ io.on("connection", (socket) => {
 
 const PORT = 3004;
 httpServer.listen(PORT, () => {
-  console.log(`Agent Chat Service running on port ${PORT}`);
+  console.log(`🎮 AgentChat Service running on port ${PORT}`);
+  loadConfig();
 });
 
 process.on("SIGTERM", () => {
-  console.log("Shutting down...");
   httpServer.close(() => process.exit(0));
 });
-
 process.on("SIGINT", () => {
-  console.log("Shutting down...");
   httpServer.close(() => process.exit(0));
 });
